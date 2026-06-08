@@ -22,15 +22,17 @@ function DashboardHome() {
 
   const scan = useMutation({
     mutationFn: () => scanFn(),
-   onSuccess: async (r: any) => {
-  if (r?.error) {
-    toast.error("Scan issue", { description: r.error });
-  } else {
-    toast.success("Inbox scanned", { description: `${r.inserted} new flights detected` });
-  }
-  await qc.invalidateQueries({ queryKey: ["flights"] });
-  await qc.refetchQueries({ queryKey: ["flights"] });
-},
+    onSuccess: async (r: any) => {
+      if (r?.error) {
+        toast.error("Scan issue", { description: r.error });
+      } else {
+        toast.success("Inbox scanned", { description: `${r.inserted} new flights detected` });
+      }
+      await qc.invalidateQueries({ queryKey: ["flights"] });
+      await qc.refetchQueries({ queryKey: ["flights"] });
+    },
+    onError: (e: any) => toast.error("Scan failed", { description: e.message }),
+  });
 
   useEffect(() => {
     if (flights.data && flights.data.length === 0 && !scan.isPending && !scan.isSuccess) {
