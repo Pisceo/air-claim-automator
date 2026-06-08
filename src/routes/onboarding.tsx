@@ -27,6 +27,12 @@ function Onboarding() {
   const [bic, setBic] = useState("");
   const [saving, setSaving] = useState(false);
   const notifyComplete = useServerFn(notifyOnboardingComplete);
+  const runScan = useServerFn(scanGmail);
+
+  useEffect(() => {
+    // Kick off mock Gmail scan early so flights are detected by the time onboarding completes
+    runScan().catch((e) => console.warn("scan failed", e));
+  }, [runScan]);
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => {
