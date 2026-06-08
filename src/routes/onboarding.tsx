@@ -25,6 +25,7 @@ function Onboarding() {
   const [iban, setIban] = useState("");
   const [bic, setBic] = useState("");
   const [saving, setSaving] = useState(false);
+  const notifyComplete = useServerFn(notifyOnboardingComplete);
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => {
@@ -64,8 +65,17 @@ function Onboarding() {
       bic: method === "bank" ? bic : null,
       onboarding_complete: true,
     }).eq("id", userId);
+    if (error) { setSaving(false); toast.error("Save failed", { description: error.message }); return; }
+
+    // Fire webhook to Make.com (non-blocking failure)
+    try {
+      const res = await notifyComplete();
+      if (!res?.ok) console.warn("Webhook notify failed", res);
+    } catch (e) {
+      console.warn("Webhook notify error", e);
+    }
+
     setSaving(false);
-    if (error) { toast.error("Save failed", { description: error.message }); return; }
     toast.success("Setup complete — monitoring now");
     navigate({ to: "/dashboard" });
   }
