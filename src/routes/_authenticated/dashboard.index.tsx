@@ -131,3 +131,56 @@ function EmptyState({ icon, title, desc }: { icon: React.ReactNode; title: strin
     </div>
   );
 }
+
+function clientSideGmailScan({ scanFn, qc, setConnecting }: { scanFn: () => Promise<any>; qc: ReturnType<typeof useQueryClient>; setConnecting: (v: boolean) => void }) {
+  const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
+  if (!clientId) {
+    toast.error("Google Client ID not configured", { description: "Set VITE_GOOGLE_CLIENT_ID in environment." });
+    return;
+  }
+  const google = (window as any).google;
+  if (!google?.accounts?.oauth2) {
+    toast.error("Google Identity script not loaded yet — try again in a moment.");
+    return;
+  }
+  setConnecting(true);
+  const tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: clientId,
+    scope: "https://www.googleapis.com/auth/gmail.readonly",
+    callback: async (tokenResponse: any) => {
+      try {
+        if (tokenResponse.error) {
+          toast.error("Google auth failed", { description: tokenResponse.error });
+          return;
+        }
+        const googleToken = tokenResponse.access_token;
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) {
+          toast.error("Not signed in");
+          return;
+        }
+        const { error: upErr } = await (supabase as any)
+          .from("profiles")
+          .update({ gmail_access_token: googleToken })
+          .eq("id", user.id);
+        if (upErr) {
+          toast.error("Failed to save token", { description: upErr.message });
+          return;
+        }
+        const result = await scanFn();
+        qc.invalidateQueries({ queryKey: ["flights"] });
+        toast.success("Gmail scanned successfully", { description: `${result?.inserted ?? 0} new flights detected` });
+      } catch (e: any) {
+        toast.error("Scan failed", { description: e?.message });
+      } finally {
+        setConnecting(false);
+      }
+    },
+  });
+  try {
+    tokenClient.requestAccessToken();
+  } catch (e: any) {
+    setConnecting(false);
+    toast.error("Failed to open Google popup", { description: e?.message });
+  }
+}
