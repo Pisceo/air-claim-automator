@@ -22,6 +22,7 @@ function SettingsPage() {
     const { data } = await (supabase as any).from("profiles").select("*").eq("id", u.user.id).single();
     setProfile(data);
   }
+
   useEffect(() => { load(); }, []);
 
   async function reupload(file: File) {
@@ -39,19 +40,7 @@ function SettingsPage() {
 
   async function deleteAccount() {
     if (!confirm("Delete account permanently? This cannot be undone.")) return;
-    const { data: u } = await supabase.auth.getUser();
-    if (!u.user) return;
     try {
-      // Delete all user data
-      await (supabase as any).from("claims").delete().eq("user_id", u.user.id);
-      await (supabase as any).from("flights").delete().eq("user_id", u.user.id);
-      await supabase.storage.from("documents").list(u.user.id).then(async ({ data }) => {
-        if (data?.length) {
-          await supabase.storage.from("documents").remove(data.map(f => `${u.user.id}/${f.name}`));
-        }
-      });
-      await (supabase as any).from("profiles").delete().eq("id", u.user.id);
-      // Delete the auth user via RPC
       await (supabase as any).rpc("delete_user");
       await supabase.auth.signOut();
       toast.success("Account deleted");
@@ -88,7 +77,7 @@ function SettingsPage() {
 
       <Section title="Danger zone" danger>
         <button onClick={async () => { await supabase.auth.signOut(); navigate({ to: "/" }); }} className="btn-ghost mr-3">
-          Disconnect Gmail
+          Sign out
         </button>
         <button onClick={deleteAccount} className="btn-ghost border-destructive text-destructive">
           <Trash2 className="w-4 h-4" /> Delete account
