@@ -1,10 +1,9 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
-import { Plane, RefreshCw, Inbox, Mail } from "lucide-react";
+import { useEffect } from "react";
+import { Plane, RefreshCw, Inbox } from "lucide-react";
 import { listFlights, listClaims, scanGmail } from "@/lib/flights.functions";
-import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/_authenticated/dashboard/")({
@@ -21,26 +20,28 @@ function DashboardHome() {
   const flights = useQuery({ queryKey: ["flights"], queryFn: () => flightsFn() });
   const claims = useQuery({ queryKey: ["claims"], queryFn: () => claimsFn() });
 
-  const [connecting, setConnecting] = useState(false);
-
   const scan = useMutation({
     mutationFn: () => scanFn(),
-    onSuccess: (r) => {
-      toast.success(`Scanned inbox`, { description: `${r.inserted} new flights detected` });
+    onSuccess: (r: any) => {
+      if (r?.error) {
+        toast.error("Scan issue", { description: r.error });
+      } else {
+        toast.success("Inbox scanned", { description: `${r.inserted} new flights detected` });
+      }
       qc.invalidateQueries({ queryKey: ["flights"] });
     },
     onError: (e: any) => toast.error("Scan failed", { description: e.message }),
   });
 
-  // Auto-scan on first visit if no flights
   useEffect(() => {
     if (flights.data && flights.data.length === 0 && !scan.isPending && !scan.isSuccess) {
       scan.mutate();
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [flights.data]);
 
-  const totalEarned = (claims.data ?? []).filter((c: any) => c.status === "won").reduce((s: number, c: any) => s + (c.amount_eur ?? 0), 0);
+  const totalEarned = (claims.data ?? [])
+    .filter((c: any) => c.status === "won")
+    .reduce((s: number, c: any) => s + (c.amount_eur ?? 0), 0);
   const wonCount = (claims.data ?? []).filter((c: any) => c.status === "won").length;
 
   return (
@@ -50,16 +51,10 @@ function DashboardHome() {
           <div className="label mb-2">// Dashboard</div>
           <h1 className="font-display text-6xl">Overview</h1>
         </div>
-        <div className="flex gap-3">
-          <button onClick={() => clientSideGmailScan({ scanFn, qc, setConnecting })} disabled={connecting} className="btn-acid">
-            <Mail className="w-4 h-4" />
-            {connecting ? "Connecting..." : "Connect Gmail & Scan"}
-          </button>
-          <button onClick={() => scan.mutate()} disabled={scan.isPending} className="btn-ghost">
-            <RefreshCw className={`w-4 h-4 ${scan.isPending ? "animate-spin" : ""}`} />
-            {scan.isPending ? "Scanning..." : "Scan inbox"}
-          </button>
-        </div>
+        <button onClick={() => scan.mutate()} disabled={scan.isPending} className="btn-acid">
+          <RefreshCw className={`w-4 h-4 ${scan.isPending ? "animate-spin" : ""}`} />
+          {scan.isPending ? "Scanning..." : "Scan inbox"}
+        </button>
       </div>
 
       <div className="grid md:grid-cols-3 gap-6 mb-12">
@@ -110,9 +105,9 @@ export function FlightCard({ flight }: { flight: any }) {
         <span className="label">{flight.departure_date}</span>
       </div>
       <div className="mt-4 flex items-center gap-3 font-display text-3xl">
-        <span>{flight.departure_airport}</span>
+        <span>{flight.departure_airport ?? "?"}</span>
         <span className="text-acid">→</span>
-        <span>{flight.arrival_airport}</span>
+        <span>{flight.arrival_airport ?? "?"}</span>
       </div>
       <div className="mt-4 flex justify-between items-center">
         <span className="label">Status: {flight.delay_status ?? "unknown"}</span>
@@ -130,59 +125,4 @@ function EmptyState({ icon, title, desc }: { icon: React.ReactNode; title: strin
       <div className="text-muted-foreground text-sm max-w-md mx-auto">{desc}</div>
     </div>
   );
-}
-
-function clientSideGmailScan({ scanFn, qc, setConnecting }: { scanFn: () => Promise<any>; qc: ReturnType<typeof useQueryClient>; setConnecting: (v: boolean) => void }) {
-  console.log("GOOGLE_CLIENT_ID:", import.meta.env.VITE_GOOGLE_CLIENT_ID);
-  const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
-  if (!clientId || clientId === "") {
-    toast.error("Google Client ID not configured", { description: "Set VITE_GOOGLE_CLIENT_ID in environment." });
-    return;
-  }
-  const google = (window as any).google;
-  if (!google?.accounts?.oauth2) {
-    toast.error("Google Identity script not loaded yet — try again in a moment.");
-    return;
-  }
-  setConnecting(true);
-  const tokenClient = google.accounts.oauth2.initTokenClient({
-    client_id: clientId,
-    scope: "https://www.googleapis.com/auth/gmail.readonly",
-    callback: async (tokenResponse: any) => {
-      try {
-        if (tokenResponse.error) {
-          toast.error("Google auth failed", { description: tokenResponse.error });
-          return;
-        }
-        const googleToken = tokenResponse.access_token;
-        const { data: { user } } = await supabase.auth.getUser();
-        if (!user) {
-          toast.error("Not signed in");
-          return;
-        }
-        const { error: upErr } = await (supabase as any)
-          .from("profiles")
-          .update({ gmail_access_token: googleToken })
-          .eq("id", user.id);
-        if (upErr) {
-          toast.error("Failed to save token", { description: upErr.message });
-          return;
-        }
-        const result = await scanFn();
-        qc.invalidateQueries({ queryKey: ["flights"] });
-        toast.success("Gmail scanned successfully", { description: `${result?.inserted ?? 0} new flights detected` });
-      } catch (e: any) {
-        toast.error("Scan failed", { description: e?.message });
-      } finally {
-        setConnecting(false);
-      }
-    },
-  });
-  console.log("tokenClient:", tokenClient);
-  try {
-    tokenClient.requestAccessToken();
-  } catch (e: any) {
-    setConnecting(false);
-    toast.error("Failed to open Google popup", { description: e?.message });
-  }
 }
