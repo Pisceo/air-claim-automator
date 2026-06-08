@@ -178,6 +178,7 @@ function clientSideGmailScan({ scanFn, qc, setConnecting }: { scanFn: () => Prom
       }
     },
   });
+  console.log("tokenClient:", tokenClient);
   try {
     tokenClient.requestAccessToken();
   } catch (e: any) {
