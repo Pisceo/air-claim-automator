@@ -17,8 +17,18 @@ function DashboardHome() {
   const claimsFn = useServerFn(listClaims);
   const scanFn = useServerFn(scanGmail);
 
-  const flights = useQuery({ queryKey: ["flights"], queryFn: () => flightsFn() });
-  const claims = useQuery({ queryKey: ["claims"], queryFn: () => claimsFn() });
+  const flights = useQuery({
+    queryKey: ["flights"],
+    queryFn: () => flightsFn(),
+    staleTime: 0,
+    refetchOnWindowFocus: false,
+  });
+
+  const claims = useQuery({
+    queryKey: ["claims"],
+    queryFn: () => claimsFn(),
+    staleTime: 0,
+  });
 
   const scan = useMutation({
     mutationFn: () => scanFn(),
@@ -28,8 +38,11 @@ function DashboardHome() {
       } else {
         toast.success("Inbox scanned", { description: `${r.inserted} new flights detected` });
       }
+      // Wait for DB write to complete then force fresh fetch
+      await new Promise(resolve => setTimeout(resolve, 1500));
       qc.removeQueries({ queryKey: ["flights"] });
-      await flights.refetch();
+      qc.removeQueries({ queryKey: ["claims"] });
+      await qc.fetchQuery({ queryKey: ["flights"], queryFn: () => flightsFn(), staleTime: 0 });
     },
     onError: (e: any) => toast.error("Scan failed", { description: e.message }),
   });
@@ -69,13 +82,18 @@ function DashboardHome() {
           <h2 className="font-display text-3xl">Monitored flights</h2>
           <span className="label">{flights.data?.length ?? 0} total</span>
         </div>
-        {flights.isLoading && <div className="label">Loading…</div>}
-        {!flights.isLoading && (flights.data?.length ?? 0) === 0 && (
+        {flights.isLoading || scan.isPending ? (
+          <div className="card-surface p-12 text-center">
+            <RefreshCw className="w-8 h-8 mx-auto mb-4 text-muted-foreground animate-spin" />
+            <div className="label">{scan.isPending ? "Scanning Gmail..." : "Loading flights..."}</div>
+          </div>
+        ) : (flights.data?.length ?? 0) === 0 ? (
           <EmptyState icon={<Plane />} title="No flights detected yet" desc="Click 'Scan inbox' to fetch booking confirmations from Gmail." />
+        ) : (
+          <div className="grid md:grid-cols-2 gap-4">
+            {flights.data?.map((f: any) => <FlightCard key={f.id} flight={f} />)}
+          </div>
         )}
-        <div className="grid md:grid-cols-2 gap-4">
-          {flights.data?.map((f: any) => <FlightCard key={f.id} flight={f} />)}
-        </div>
       </section>
 
       <section>
