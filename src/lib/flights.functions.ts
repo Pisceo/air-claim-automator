@@ -19,7 +19,7 @@ export const scanGmail = createServerFn({ method: "POST" })
     const { supabase, userId } = context;
 
     // Fetch existing flight numbers
-    const { data: existing } = await supabase.from("flights").select("flight_number, departure_date").eq("user_id", userId);
+    const { data: existing } = await (supabase as any).from("flights").select("flight_number, departure_date").eq("user_id", userId);
     const seen = new Set((existing ?? []).map((f: any) => `${f.flight_number}-${f.departure_date}`));
 
     const toInsert = MOCK_FLIGHTS
@@ -27,7 +27,7 @@ export const scanGmail = createServerFn({ method: "POST" })
       .map(f => ({ ...f, user_id: userId }));
 
     if (toInsert.length > 0) {
-      const { error } = await supabase.from("flights").insert(toInsert);
+      const { error } = await (supabase as any).from("flights").insert(toInsert);
       if (error) throw new Error(error.message);
     }
 
@@ -38,7 +38,7 @@ export const listFlights = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const { supabase, userId } = context;
-    const { data, error } = await supabase.from("flights").select("*").eq("user_id", userId).order("departure_date", { ascending: false });
+    const { data, error } = await (supabase as any).from("flights").select("*").eq("user_id", userId).order("departure_date", { ascending: false });
     if (error) throw new Error(error.message);
     return data ?? [];
   });
@@ -60,7 +60,7 @@ export const getProfile = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const { supabase, userId } = context;
-    const { data, error } = await supabase.from("profiles").select("*").eq("id", userId).single();
+    const { data, error } = await (supabase as any).from("profiles").select("*").eq("id", userId).single();
     if (error) throw new Error(error.message);
     return data;
   });

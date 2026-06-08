@@ -29,7 +29,7 @@ function Onboarding() {
       if (!data.user) { navigate({ to: "/auth" }); return; }
       setUserId(data.user.id);
       setEmail(data.user.email ?? "");
-      supabase.from("profiles").select("*").eq("id", data.user.id).single().then(({ data: p }) => {
+      (supabase as any).from("profiles").select("*").eq("id", data.user.id).single().then(({ data: p }) => {
         if (p) {
           setPassportUploaded(p.passport_uploaded);
           if (p.onboarding_complete) navigate({ to: "/dashboard" });
@@ -44,7 +44,7 @@ function Onboarding() {
     const path = `${userId}/passport-${Date.now()}-${file.name}`;
     const { error } = await supabase.storage.from("documents").upload(path, file, { upsert: true });
     if (error) { toast.error("Upload failed", { description: error.message }); setUploading(false); return; }
-    await supabase.from("profiles").update({ passport_uploaded: true }).eq("id", userId);
+    await (supabase as any).from("profiles").update({ passport_uploaded: true }).eq("id", userId);
     setPassportUploaded(true);
     setUploading(false);
     toast.success("Passport uploaded");
@@ -55,7 +55,7 @@ function Onboarding() {
     if (method === "paypal" && !paypalEmail) { toast.error("Enter your PayPal email"); return; }
     if (method === "bank" && (!iban || !bic)) { toast.error("Enter IBAN and BIC"); return; }
     setSaving(true);
-    const { error } = await supabase.from("profiles").update({
+    const { error } = await (supabase as any).from("profiles").update({
       payout_method: method,
       paypal_email: method === "paypal" ? paypalEmail : null,
       iban: method === "bank" ? iban : null,

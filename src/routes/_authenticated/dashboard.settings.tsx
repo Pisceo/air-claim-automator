@@ -19,7 +19,7 @@ function SettingsPage() {
     const { data: u } = await supabase.auth.getUser();
     if (!u.user) return;
     setEmail(u.user.email ?? "");
-    const { data } = await supabase.from("profiles").select("*").eq("id", u.user.id).single();
+    const { data } = await (supabase as any).from("profiles").select("*").eq("id", u.user.id).single();
     setProfile(data);
   }
   useEffect(() => { load(); }, []);
@@ -31,7 +31,7 @@ function SettingsPage() {
     const path = `${u.user.id}/passport-${Date.now()}-${file.name}`;
     const { error } = await supabase.storage.from("documents").upload(path, file);
     if (error) { toast.error(error.message); setUploading(false); return; }
-    await supabase.from("profiles").update({ passport_uploaded: true }).eq("id", u.user.id);
+    await (supabase as any).from("profiles").update({ passport_uploaded: true }).eq("id", u.user.id);
     toast.success("Passport replaced");
     setUploading(false);
     load();
