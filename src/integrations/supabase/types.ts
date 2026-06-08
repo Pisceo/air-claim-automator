@@ -14,7 +14,134 @@ export type Database = {
   }
   public: {
     Tables: {
-      [_ in never]: never
+      claims: {
+        Row: {
+          amount_eur: number | null
+          created_at: string
+          filed_at: string
+          flight_id: string
+          id: string
+          paid_at: string | null
+          status: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          amount_eur?: number | null
+          created_at?: string
+          filed_at?: string
+          flight_id: string
+          id?: string
+          paid_at?: string | null
+          status?: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          amount_eur?: number | null
+          created_at?: string
+          filed_at?: string
+          flight_id?: string
+          id?: string
+          paid_at?: string | null
+          status?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "claims_flight_id_fkey"
+            columns: ["flight_id"]
+            isOneToOne: false
+            referencedRelation: "flights"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      flights: {
+        Row: {
+          airline: string
+          arrival_airport: string
+          created_at: string
+          departure_airport: string
+          departure_date: string
+          flight_number: string
+          id: string
+          raw_email_snippet: string | null
+          status: string
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          airline: string
+          arrival_airport: string
+          created_at?: string
+          departure_airport: string
+          departure_date: string
+          flight_number: string
+          id?: string
+          raw_email_snippet?: string | null
+          status?: string
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          airline?: string
+          arrival_airport?: string
+          created_at?: string
+          departure_airport?: string
+          departure_date?: string
+          flight_number?: string
+          id?: string
+          raw_email_snippet?: string | null
+          status?: string
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
+      profiles: {
+        Row: {
+          bic: string | null
+          created_at: string
+          email: string | null
+          full_name: string | null
+          iban: string | null
+          id: string
+          onboarding_complete: boolean
+          passport_uploaded: boolean
+          payout_method: string | null
+          paypal_email: string | null
+          updated_at: string
+        }
+        Insert: {
+          bic?: string | null
+          created_at?: string
+          email?: string | null
+          full_name?: string | null
+          iban?: string | null
+          id: string
+          onboarding_complete?: boolean
+          passport_uploaded?: boolean
+          payout_method?: string | null
+          paypal_email?: string | null
+          updated_at?: string
+        }
+        Update: {
+          bic?: string | null
+          created_at?: string
+          email?: string | null
+          full_name?: string | null
+          iban?: string | null
+          id?: string
+          onboarding_complete?: boolean
+          passport_uploaded?: boolean
+          payout_method?: string | null
+          paypal_email?: string | null
+          updated_at?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
