@@ -57,6 +57,10 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
       { property: "og:description", content: "Zero-touch EU261 flight compensation. Connect Gmail and we file every claim for you." },
       { property: "og:type", content: "website" },
       { name: "twitter:card", content: "summary_large_image" },
+      { name: "twitter:title", content: "Flew — Set it once. Get paid forever." },
+      { name: "twitter:description", content: "Zero-touch EU261 flight compensation. Connect Gmail and we file every claim for you." },
+      { property: "og:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/4c1b690a-1d00-46a7-8692-c273b47ce191/id-preview-a8e54837--da94ca2d-ab60-4eb1-af12-256ccc16e85d.lovable.app-1780952133664.png" },
+      { name: "twitter:image", content: "https://pub-bb2e103a32db4e198524a2e9ed8f35b4.r2.dev/4c1b690a-1d00-46a7-8692-c273b47ce191/id-preview-a8e54837--da94ca2d-ab60-4eb1-af12-256ccc16e85d.lovable.app-1780952133664.png" },
     ],
     links: [
       { rel: "stylesheet", href: appCss },
