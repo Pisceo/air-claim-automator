@@ -15,9 +15,39 @@ function AuthPage() {
   const [loading, setLoading] = useState(false);
 
   useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      if (data.session) navigate({ to: "/onboarding" });
-    });
+    let cancelled = false;
+
+    async function completeOAuthRedirect() {
+      const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+      const searchParams = new URLSearchParams(window.location.search);
+      const oauthError = hashParams.get("error") ?? searchParams.get("error");
+      const accessToken = hashParams.get("access_token") ?? searchParams.get("access_token");
+      const refreshToken = hashParams.get("refresh_token") ?? searchParams.get("refresh_token");
+
+      if (oauthError) {
+        const description = hashParams.get("error_description") ?? searchParams.get("error_description") ?? oauthError;
+        window.history.replaceState(null, "", window.location.pathname);
+        toast.error("Sign-in failed", { description });
+        return;
+      }
+
+      if (accessToken && refreshToken) {
+        const { error } = await supabase.auth.setSession({ access_token: accessToken, refresh_token: refreshToken });
+        window.history.replaceState(null, "", window.location.pathname);
+        if (error) {
+          toast.error("Sign-in failed", { description: error.message });
+          return;
+        }
+        if (!cancelled) navigate({ to: "/onboarding" });
+        return;
+      }
+
+      const { data } = await supabase.auth.getSession();
+      if (!cancelled && data.session) navigate({ to: "/onboarding" });
+    }
+
+    completeOAuthRedirect();
+    return () => { cancelled = true; };
   }, [navigate]);
 
   async function signIn() {
