@@ -38,12 +38,22 @@ function AuthPage() {
           toast.error("Sign-in failed", { description: error.message });
           return;
         }
-        if (!cancelled) navigate({ to: "/onboarding" });
+        const { data: { user } } = await supabase.auth.getUser();
+        if (user) {
+          const { data: profile } = await (supabase as any).from("profiles").select("onboarding_complete").eq("id", user.id).maybeSingle();
+          if (!cancelled) navigate({ to: profile?.onboarding_complete ? "/dashboard" : "/onboarding" });
+        }
         return;
       }
 
       const { data } = await supabase.auth.getSession();
-      if (!cancelled && data.session) navigate({ to: "/onboarding" });
+      if (!cancelled && data.session) {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (user) {
+          const { data: profile } = await (supabase as any).from("profiles").select("onboarding_complete").eq("id", user.id).maybeSingle();
+          if (!cancelled) navigate({ to: profile?.onboarding_complete ? "/dashboard" : "/onboarding" });
+        }
+      }
     }
 
     completeOAuthRedirect();
