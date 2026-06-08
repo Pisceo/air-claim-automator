@@ -1,9 +1,10 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
-import { Plane, RefreshCw, Inbox } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Plane, RefreshCw, Inbox, Mail } from "lucide-react";
 import { listFlights, listClaims, scanGmail } from "@/lib/flights.functions";
+import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/_authenticated/dashboard/")({
@@ -19,6 +20,8 @@ function DashboardHome() {
 
   const flights = useQuery({ queryKey: ["flights"], queryFn: () => flightsFn() });
   const claims = useQuery({ queryKey: ["claims"], queryFn: () => claimsFn() });
+
+  const [connecting, setConnecting] = useState(false);
 
   const scan = useMutation({
     mutationFn: () => scanFn(),
@@ -47,10 +50,16 @@ function DashboardHome() {
           <div className="label mb-2">// Dashboard</div>
           <h1 className="font-display text-6xl">Overview</h1>
         </div>
-        <button onClick={() => scan.mutate()} disabled={scan.isPending} className="btn-acid">
-          <RefreshCw className={`w-4 h-4 ${scan.isPending ? "animate-spin" : ""}`} />
-          {scan.isPending ? "Scanning..." : "Scan inbox"}
-        </button>
+        <div className="flex gap-3">
+          <button onClick={() => clientSideGmailScan({ scanFn, qc, setConnecting })} disabled={connecting} className="btn-acid">
+            <Mail className="w-4 h-4" />
+            {connecting ? "Connecting..." : "Connect Gmail & Scan"}
+          </button>
+          <button onClick={() => scan.mutate()} disabled={scan.isPending} className="btn-ghost">
+            <RefreshCw className={`w-4 h-4 ${scan.isPending ? "animate-spin" : ""}`} />
+            {scan.isPending ? "Scanning..." : "Scan inbox"}
+          </button>
+        </div>
       </div>
 
       <div className="grid md:grid-cols-3 gap-6 mb-12">
@@ -121,4 +130,57 @@ function EmptyState({ icon, title, desc }: { icon: React.ReactNode; title: strin
       <div className="text-muted-foreground text-sm max-w-md mx-auto">{desc}</div>
     </div>
   );
+}
+
+function clientSideGmailScan({ scanFn, qc, setConnecting }: { scanFn: () => Promise<any>; qc: ReturnType<typeof useQueryClient>; setConnecting: (v: boolean) => void }) {
+  const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
+  if (!clientId) {
+    toast.error("Google Client ID not configured", { description: "Set VITE_GOOGLE_CLIENT_ID in environment." });
+    return;
+  }
+  const google = (window as any).google;
+  if (!google?.accounts?.oauth2) {
+    toast.error("Google Identity script not loaded yet — try again in a moment.");
+    return;
+  }
+  setConnecting(true);
+  const tokenClient = google.accounts.oauth2.initTokenClient({
+    client_id: clientId,
+    scope: "https://www.googleapis.com/auth/gmail.readonly",
+    callback: async (tokenResponse: any) => {
+      try {
+        if (tokenResponse.error) {
+          toast.error("Google auth failed", { description: tokenResponse.error });
+          return;
+        }
+        const googleToken = tokenResponse.access_token;
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) {
+          toast.error("Not signed in");
+          return;
+        }
+        const { error: upErr } = await (supabase as any)
+          .from("profiles")
+          .update({ gmail_access_token: googleToken })
+          .eq("id", user.id);
+        if (upErr) {
+          toast.error("Failed to save token", { description: upErr.message });
+          return;
+        }
+        const result = await scanFn();
+        qc.invalidateQueries({ queryKey: ["flights"] });
+        toast.success("Gmail scanned successfully", { description: `${result?.inserted ?? 0} new flights detected` });
+      } catch (e: any) {
+        toast.error("Scan failed", { description: e?.message });
+      } finally {
+        setConnecting(false);
+      }
+    },
+  });
+  try {
+    tokenClient.requestAccessToken();
+  } catch (e: any) {
+    setConnecting(false);
+    toast.error("Failed to open Google popup", { description: e?.message });
+  }
 }
