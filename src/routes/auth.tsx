@@ -63,7 +63,7 @@ function AuthPage() {
   async function signIn() {
     setLoading(true);
     const result = await lovable.auth.signInWithOAuth("google", {
-      redirect_uri: window.location.origin + "/auth",
+      redirect_uri: "https://air-claim-automator.lovable.app/auth",
       extraParams: {
         scope: "openid email profile https://www.googleapis.com/auth/gmail.readonly",
         access_type: "offline",
