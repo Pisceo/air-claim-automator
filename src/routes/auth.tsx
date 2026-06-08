@@ -24,6 +24,11 @@ function AuthPage() {
     setLoading(true);
     const result = await lovable.auth.signInWithOAuth("google", {
       redirect_uri: window.location.origin + "/onboarding",
+      extraParams: {
+        scope: "openid email profile https://www.googleapis.com/auth/gmail.readonly",
+        access_type: "offline",
+        prompt: "consent",
+      },
     });
     if (result.error) {
       toast.error("Sign-in failed", { description: String(result.error) });
