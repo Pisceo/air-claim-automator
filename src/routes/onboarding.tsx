@@ -29,7 +29,7 @@ function Onboarding() {
       if (!data.user) { navigate({ to: "/auth" }); return; }
       setUserId(data.user.id);
       setEmail(data.user.email ?? "");
-      (supabase as any).from("profiles").select("*").eq("id", data.user.id).single().then(({ data: p }) => {
+      (supabase as any).from("profiles").select("*").eq("id", data.user.id).single().then(({ data: p }: { data: any }) => {
         if (p) {
           setPassportUploaded(p.passport_uploaded);
           if (p.onboarding_complete) navigate({ to: "/dashboard" });
