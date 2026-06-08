@@ -32,8 +32,11 @@ function AuthPage() {
       }
 
       const providerToken = hashParams.get("provider_token");
+      console.log("[auth] provider_token from hash:", providerToken ? `FOUND (${providerToken.substring(0, 20)}...)` : "NOT FOUND");
+      console.log("[auth] full hash params:", window.location.hash.substring(0, 200));
 
       const { data: { session }, error } = await supabase.auth.getSession();
+      console.log("[auth] session user id:", session?.user?.id ?? "NONE");
 
       if (error) {
         toast.error("Sign-in failed", { description: error.message });
@@ -41,11 +44,14 @@ function AuthPage() {
       }
 
       if (session) {
-        if (providerToken) {
-          await (supabase as any)
+        if (providerToken && session.user?.id) {
+          const { error: updateError } = await (supabase as any)
             .from("profiles")
-            .upsert({ id: session.user.id, email: session.user.email, gmail_access_token: providerToken })
+            .update({ gmail_access_token: providerToken })
             .eq("id", session.user.id);
+          console.log("[auth] Token write result:", updateError ? `ERROR: ${updateError.message}` : "SUCCESS");
+        } else {
+          console.log("[auth] Skipping token write — providerToken:", !!providerToken, "userId:", session.user?.id);
         }
 
         window.history.replaceState(null, "", window.location.pathname);
@@ -60,6 +66,7 @@ function AuthPage() {
         }
         return;
       }
+
 
       const accessToken = hashParams.get("access_token") ?? searchParams.get("access_token");
       const refreshToken = hashParams.get("refresh_token") ?? searchParams.get("refresh_token");
