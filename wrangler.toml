@@ -9,5 +9,5 @@ VITE_SUPABASE_URL = "https://jqfregzookauxjdvgina.supabase.co"
 SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpxZnJlZ3pvb2thdXhqZHZnaW5hIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA5NDE3NzUsImV4cCI6MjA5NjUxNzc3NX0.bcsb1-eH0vSx1OkUHIGAk4fzkctu59yHx3RxwNYwuvs"
 VITE_SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpxZnJlZ3pvb2thdXhqZHZnaW5hIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA5NDE3NzUsImV4cCI6MjA5NjUxNzc3NX0.bcsb1-eH0vSx1OkUHIGAk4fzkctu59yHx3RxwNYwuvs"
 
-[site]
-bucket = "dist/client"
+[assets]
+directory = "dist/client"
