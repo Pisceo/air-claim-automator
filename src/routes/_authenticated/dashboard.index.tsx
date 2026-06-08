@@ -133,8 +133,9 @@ function EmptyState({ icon, title, desc }: { icon: React.ReactNode; title: strin
 }
 
 function clientSideGmailScan({ scanFn, qc, setConnecting }: { scanFn: () => Promise<any>; qc: ReturnType<typeof useQueryClient>; setConnecting: (v: boolean) => void }) {
+  console.log("GOOGLE_CLIENT_ID:", import.meta.env.VITE_GOOGLE_CLIENT_ID);
   const clientId = import.meta.env.VITE_GOOGLE_CLIENT_ID;
-  if (!clientId) {
+  if (!clientId || clientId === "") {
     toast.error("Google Client ID not configured", { description: "Set VITE_GOOGLE_CLIENT_ID in environment." });
     return;
   }
@@ -177,6 +178,7 @@ function clientSideGmailScan({ scanFn, qc, setConnecting }: { scanFn: () => Prom
       }
     },
   });
+  console.log("tokenClient:", tokenClient);
   try {
     tokenClient.requestAccessToken();
   } catch (e: any) {
