@@ -9,7 +9,7 @@ export const notifyOnboardingComplete = createServerFn({ method: "POST" })
     const { supabase, userId } = context;
 
     const { data: profile, error: pErr } = await (supabase as any)
-      .from("profiles").select("*").eq("id", userId).single();
+      .from("profiles").select("*").eq("id", userId).maybeSingle();
     if (pErr) throw new Error(pErr.message);
 
     const { data: flights, error: fErr } = await (supabase as any)
