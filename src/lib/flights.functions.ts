@@ -6,8 +6,12 @@ export const scanGmail = createServerFn({ method: "POST" })
   .handler(async ({ context }) => {
     const { supabase, userId } = context;
 
-    const { data: { session } } = await supabase.auth.getSession();
-    const googleToken = (session as any)?.provider_token;
+    const { data: profileData } = await (supabase as any)
+      .from("profiles")
+      .select("gmail_access_token")
+      .eq("id", userId)
+      .single();
+    const googleToken = profileData?.gmail_access_token;
 
     if (!googleToken) {
       return insertMockFlights(supabase, userId);
