@@ -3,6 +3,7 @@ import { useEffect, useState } from "react";
 import { Check, Upload, ArrowRight, Plane, Mail } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { notifyOnboardingComplete } from "@/lib/webhook.functions";
+import { scanGmail } from "@/lib/flights.functions";
 import { useServerFn } from "@tanstack/react-start";
 import { toast } from "sonner";
 
