@@ -2,6 +2,9 @@ import { createFileRoute, useNavigate, Link } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
 import { Check, Upload, ArrowRight, Plane, Mail } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
+import { notifyOnboardingComplete } from "@/lib/webhook.functions";
+import { scanGmail } from "@/lib/flights.functions";
+import { useServerFn } from "@tanstack/react-start";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/onboarding")({
@@ -23,6 +26,13 @@ function Onboarding() {
   const [iban, setIban] = useState("");
   const [bic, setBic] = useState("");
   const [saving, setSaving] = useState(false);
+  const notifyComplete = useServerFn(notifyOnboardingComplete);
+  const runScan = useServerFn(scanGmail);
+
+  useEffect(() => {
+    // Kick off mock Gmail scan early so flights are detected by the time onboarding completes
+    runScan().catch((e) => console.warn("scan failed", e));
+  }, [runScan]);
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => {
@@ -62,8 +72,17 @@ function Onboarding() {
       bic: method === "bank" ? bic : null,
       onboarding_complete: true,
     }).eq("id", userId);
+    if (error) { setSaving(false); toast.error("Save failed", { description: error.message }); return; }
+
+    // Fire webhook to Make.com (non-blocking failure)
+    try {
+      const res = await notifyComplete();
+      if (!res?.ok) console.warn("Webhook notify failed", res);
+    } catch (e) {
+      console.warn("Webhook notify error", e);
+    }
+
     setSaving(false);
-    if (error) { toast.error("Save failed", { description: error.message }); return; }
     toast.success("Setup complete — monitoring now");
     navigate({ to: "/dashboard" });
   }
