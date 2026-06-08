@@ -47,7 +47,7 @@ export const listClaims = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const { supabase, userId } = context;
-    const { data, error } = await supabase
+    const { data, error } = await (supabase as any)
       .from("claims")
       .select("*, flights(airline, flight_number, departure_airport, arrival_airport, departure_date)")
       .eq("user_id", userId)
