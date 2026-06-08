@@ -1,7 +1,6 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { Plane, ArrowRight } from "lucide-react";
-import { lovable } from "@/integrations/lovable";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 
@@ -13,107 +12,99 @@ export const Route = createFileRoute("/auth")({
 function AuthPage() {
   const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
+  const handled = useRef(false);
 
   useEffect(() => {
-    let cancelled = false;
+    if (handled.current) return;
 
-    async function completeOAuthRedirect() {
-      await new Promise(resolve => setTimeout(resolve, 500));
+    async function handleCallback() {
+      const hash = window.location.hash;
+      const search = window.location.search;
+      const hashParams = new URLSearchParams(hash.replace(/^#/, ""));
+      const searchParams = new URLSearchParams(search);
 
-      const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
-      const searchParams = new URLSearchParams(window.location.search);
-
-      const oauthError = hashParams.get("error") ?? searchParams.get("error");
-      if (oauthError) {
-        const description = hashParams.get("error_description") ?? searchParams.get("error_description") ?? oauthError;
-        window.history.replaceState(null, "", window.location.pathname);
-        toast.error("Sign-in failed", { description });
-        return;
-      }
-
-      const providerToken = hashParams.get("provider_token");
-      console.log("[auth] provider_token from hash:", providerToken ? `FOUND (${providerToken.substring(0, 20)}...)` : "NOT FOUND");
-      console.log("[auth] full hash params:", window.location.hash.substring(0, 200));
-
-      const { data: { session }, error } = await supabase.auth.getSession();
-      console.log("[auth] session user id:", session?.user?.id ?? "NONE");
-
+      const error = hashParams.get("error") ?? searchParams.get("error");
       if (error) {
-        toast.error("Sign-in failed", { description: error.message });
+        const desc = hashParams.get("error_description") ?? error;
+        window.history.replaceState(null, "", window.location.pathname);
+        toast.error("Sign-in failed", { description: desc });
         return;
       }
 
-      if (session) {
-        if (providerToken && session.user?.id) {
-          const { error: updateError } = await (supabase as any)
-            .from("profiles")
-            .update({ gmail_access_token: providerToken })
-            .eq("id", session.user.id);
-          console.log("[auth] Token write result:", updateError ? `ERROR: ${updateError.message}` : "SUCCESS");
-        } else {
-          console.log("[auth] Skipping token write — providerToken:", !!providerToken, "userId:", session.user?.id);
+      const accessToken = hashParams.get("access_token") ?? searchParams.get("access_token");
+      const refreshToken = hashParams.get("refresh_token") ?? searchParams.get("refresh_token");
+      const providerToken = hashParams.get("provider_token") ?? searchParams.get("provider_token");
+
+      if (accessToken && refreshToken) {
+        handled.current = true;
+        window.history.replaceState(null, "", window.location.pathname);
+
+        const { error: sessionError } = await supabase.auth.setSession({
+          access_token: accessToken,
+          refresh_token: refreshToken,
+        });
+
+        if (sessionError) {
+          toast.error("Sign-in failed", { description: sessionError.message });
+          return;
         }
 
-        window.history.replaceState(null, "", window.location.pathname);
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!user) return;
+
+        const profileUpdate: Record<string, string> = {
+          email: user.email ?? "",
+          full_name: user.user_metadata?.full_name ?? user.user_metadata?.name ?? "",
+        };
+        if (providerToken) {
+          profileUpdate.gmail_access_token = providerToken;
+        }
+
+        await (supabase as any)
+          .from("profiles")
+          .upsert({ id: user.id, ...profileUpdate }, { onConflict: "id" });
+
+        const { data: profile } = await (supabase as any)
+          .from("profiles")
+          .select("onboarding_complete")
+          .eq("id", user.id)
+          .single();
+
+        navigate({ to: profile?.onboarding_complete ? "/dashboard" : "/onboarding" });
+        return;
+      }
+
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session) {
         const { data: profile } = await (supabase as any)
           .from("profiles")
           .select("onboarding_complete")
           .eq("id", session.user.id)
           .single();
-
-        if (!cancelled) {
-          navigate({ to: profile?.onboarding_complete ? "/dashboard" : "/onboarding" });
-        }
-        return;
-      }
-
-
-      const accessToken = hashParams.get("access_token") ?? searchParams.get("access_token");
-      const refreshToken = hashParams.get("refresh_token") ?? searchParams.get("refresh_token");
-
-      if (accessToken && refreshToken) {
-        const { error: setError } = await supabase.auth.setSession({
-          access_token: accessToken,
-          refresh_token: refreshToken,
-        });
-        window.history.replaceState(null, "", window.location.pathname);
-        if (setError) { toast.error("Sign-in failed", { description: setError.message }); return; }
-
-        const { data: { user } } = await supabase.auth.getUser();
-        if (user) {
-          if (providerToken) {
-            await (supabase as any)
-              .from("profiles")
-              .upsert({ id: user.id, email: user.email, gmail_access_token: providerToken });
-          }
-          const { data: profile } = await (supabase as any)
-            .from("profiles").select("onboarding_complete").eq("id", user.id).single();
-          if (!cancelled) navigate({ to: profile?.onboarding_complete ? "/dashboard" : "/onboarding" });
-        }
+        navigate({ to: profile?.onboarding_complete ? "/dashboard" : "/onboarding" });
       }
     }
 
-    completeOAuthRedirect();
-    return () => { cancelled = true; };
+    handleCallback();
   }, [navigate]);
 
   async function signIn() {
     setLoading(true);
-    const result = await lovable.auth.signInWithOAuth("google", {
-      redirect_uri: "https://air-claim-automator.lovable.app/auth",
-      extraParams: {
-        scope: "openid email profile https://www.googleapis.com/auth/gmail.readonly",
-        access_type: "offline",
-        prompt: "consent",
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: "google",
+      options: {
+        redirectTo: window.location.origin + "/auth",
+        scopes: "openid email profile https://www.googleapis.com/auth/gmail.readonly",
+        queryParams: {
+          access_type: "offline",
+          prompt: "consent",
+        },
       },
     });
-    if (result.error) {
-      toast.error("Sign-in failed", { description: String(result.error) });
+    if (error) {
+      toast.error("Sign-in failed", { description: error.message });
       setLoading(false);
-      return;
     }
-    if (result.redirected) return;
-    navigate({ to: "/onboarding" });
   }
 
   return (
@@ -129,7 +120,6 @@ function AuthPage() {
           <Link to="/" className="label">← Back</Link>
         </div>
       </header>
-
       <main className="flex-1 flex items-center justify-center px-6">
         <div className="w-full max-w-md card-surface p-10">
           <div className="label mb-4">// Step 0 of 3</div>
@@ -137,11 +127,9 @@ function AuthPage() {
           <p className="text-muted-foreground mb-10 text-sm">
             We need read access to scan booking confirmations and delay notifications. We never send mail from your account.
           </p>
-
           <button onClick={signIn} disabled={loading} className="btn-acid w-full">
             {loading ? "Connecting..." : (<>Continue with Google <ArrowRight className="w-4 h-4" /></>)}
           </button>
-
           <div className="mt-8 pt-6 border-t border-border label leading-relaxed">
             By continuing you agree to Flew filing EU261 claims on your behalf. 15% success fee. No upfront cost.
           </div>
