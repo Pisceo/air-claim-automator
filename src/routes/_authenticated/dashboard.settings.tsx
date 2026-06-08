@@ -39,9 +39,26 @@ function SettingsPage() {
 
   async function deleteAccount() {
     if (!confirm("Delete account permanently? This cannot be undone.")) return;
-    await supabase.auth.signOut();
-    toast.success("Signed out — contact support to fully delete data");
-    navigate({ to: "/" });
+    const { data: u } = await supabase.auth.getUser();
+    if (!u.user) return;
+    try {
+      // Delete all user data
+      await (supabase as any).from("claims").delete().eq("user_id", u.user.id);
+      await (supabase as any).from("flights").delete().eq("user_id", u.user.id);
+      await supabase.storage.from("documents").list(u.user.id).then(async ({ data }) => {
+        if (data?.length) {
+          await supabase.storage.from("documents").remove(data.map(f => `${u.user.id}/${f.name}`));
+        }
+      });
+      await (supabase as any).from("profiles").delete().eq("id", u.user.id);
+      // Delete the auth user via RPC
+      await (supabase as any).rpc("delete_user");
+      await supabase.auth.signOut();
+      toast.success("Account deleted");
+      navigate({ to: "/" });
+    } catch (e: any) {
+      toast.error("Delete failed", { description: e.message });
+    }
   }
 
   return (
