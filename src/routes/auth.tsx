@@ -18,12 +18,12 @@ function AuthPage() {
     let cancelled = false;
 
     async function completeOAuthRedirect() {
+      await new Promise(resolve => setTimeout(resolve, 500));
+
       const hashParams = new URLSearchParams(window.location.hash.replace(/^#/, ""));
       const searchParams = new URLSearchParams(window.location.search);
-      const oauthError = hashParams.get("error") ?? searchParams.get("error");
-      const accessToken = hashParams.get("access_token") ?? searchParams.get("access_token");
-      const refreshToken = hashParams.get("refresh_token") ?? searchParams.get("refresh_token");
 
+      const oauthError = hashParams.get("error") ?? searchParams.get("error");
       if (oauthError) {
         const description = hashParams.get("error_description") ?? searchParams.get("error_description") ?? oauthError;
         window.history.replaceState(null, "", window.location.pathname);
@@ -31,26 +31,56 @@ function AuthPage() {
         return;
       }
 
-      if (accessToken && refreshToken) {
-        const { error } = await supabase.auth.setSession({ access_token: accessToken, refresh_token: refreshToken });
-        window.history.replaceState(null, "", window.location.pathname);
-        if (error) {
-          toast.error("Sign-in failed", { description: error.message });
-          return;
+      const providerToken = hashParams.get("provider_token");
+
+      const { data: { session }, error } = await supabase.auth.getSession();
+
+      if (error) {
+        toast.error("Sign-in failed", { description: error.message });
+        return;
+      }
+
+      if (session) {
+        if (providerToken) {
+          await (supabase as any)
+            .from("profiles")
+            .upsert({ id: session.user.id, email: session.user.email, gmail_access_token: providerToken })
+            .eq("id", session.user.id);
         }
-        const { data: { user } } = await supabase.auth.getUser();
-        if (user) {
-          const { data: profile } = await (supabase as any).from("profiles").select("onboarding_complete").eq("id", user.id).maybeSingle();
-          if (!cancelled) navigate({ to: profile?.onboarding_complete ? "/dashboard" : "/onboarding" });
+
+        window.history.replaceState(null, "", window.location.pathname);
+        const { data: profile } = await (supabase as any)
+          .from("profiles")
+          .select("onboarding_complete")
+          .eq("id", session.user.id)
+          .single();
+
+        if (!cancelled) {
+          navigate({ to: profile?.onboarding_complete ? "/dashboard" : "/onboarding" });
         }
         return;
       }
 
-      const { data } = await supabase.auth.getSession();
-      if (!cancelled && data.session) {
+      const accessToken = hashParams.get("access_token") ?? searchParams.get("access_token");
+      const refreshToken = hashParams.get("refresh_token") ?? searchParams.get("refresh_token");
+
+      if (accessToken && refreshToken) {
+        const { error: setError } = await supabase.auth.setSession({
+          access_token: accessToken,
+          refresh_token: refreshToken,
+        });
+        window.history.replaceState(null, "", window.location.pathname);
+        if (setError) { toast.error("Sign-in failed", { description: setError.message }); return; }
+
         const { data: { user } } = await supabase.auth.getUser();
         if (user) {
-          const { data: profile } = await (supabase as any).from("profiles").select("onboarding_complete").eq("id", user.id).maybeSingle();
+          if (providerToken) {
+            await (supabase as any)
+              .from("profiles")
+              .upsert({ id: user.id, email: user.email, gmail_access_token: providerToken });
+          }
+          const { data: profile } = await (supabase as any)
+            .from("profiles").select("onboarding_complete").eq("id", user.id).single();
           if (!cancelled) navigate({ to: profile?.onboarding_complete ? "/dashboard" : "/onboarding" });
         }
       }

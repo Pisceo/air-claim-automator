@@ -106,6 +106,7 @@ export type Database = {
           created_at: string
           email: string | null
           full_name: string | null
+          gmail_access_token: string | null
           iban: string | null
           id: string
           onboarding_complete: boolean
@@ -119,6 +120,7 @@ export type Database = {
           created_at?: string
           email?: string | null
           full_name?: string | null
+          gmail_access_token?: string | null
           iban?: string | null
           id: string
           onboarding_complete?: boolean
@@ -132,6 +134,7 @@ export type Database = {
           created_at?: string
           email?: string | null
           full_name?: string | null
+          gmail_access_token?: string | null
           iban?: string | null
           id?: string
           onboarding_complete?: boolean
