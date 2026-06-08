@@ -28,8 +28,8 @@ function DashboardHome() {
       } else {
         toast.success("Inbox scanned", { description: `${r.inserted} new flights detected` });
       }
-      await qc.invalidateQueries({ queryKey: ["flights"] });
-      await qc.refetchQueries({ queryKey: ["flights"] });
+      qc.removeQueries({ queryKey: ["flights"] });
+      await flights.refetch();
     },
     onError: (e: any) => toast.error("Scan failed", { description: e.message }),
   });
@@ -74,7 +74,7 @@ function DashboardHome() {
           <EmptyState icon={<Plane />} title="No flights detected yet" desc="Click 'Scan inbox' to fetch booking confirmations from Gmail." />
         )}
         <div className="grid md:grid-cols-2 gap-4">
-          {flights.data?.slice(0, 6).map((f: any) => <FlightCard key={f.id} flight={f} />)}
+          {flights.data?.map((f: any) => <FlightCard key={f.id} flight={f} />)}
         </div>
       </section>
 
