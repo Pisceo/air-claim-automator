@@ -1,9 +1,10 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
-import { Plane, RefreshCw, Inbox } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Plane, RefreshCw, Inbox, Mail } from "lucide-react";
 import { listFlights, listClaims, scanGmail } from "@/lib/flights.functions";
+import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 
 export const Route = createFileRoute("/_authenticated/dashboard/")({
@@ -19,6 +20,8 @@ function DashboardHome() {
 
   const flights = useQuery({ queryKey: ["flights"], queryFn: () => flightsFn() });
   const claims = useQuery({ queryKey: ["claims"], queryFn: () => claimsFn() });
+
+  const [connecting, setConnecting] = useState(false);
 
   const scan = useMutation({
     mutationFn: () => scanFn(),
@@ -47,10 +50,16 @@ function DashboardHome() {
           <div className="label mb-2">// Dashboard</div>
           <h1 className="font-display text-6xl">Overview</h1>
         </div>
-        <button onClick={() => scan.mutate()} disabled={scan.isPending} className="btn-acid">
-          <RefreshCw className={`w-4 h-4 ${scan.isPending ? "animate-spin" : ""}`} />
-          {scan.isPending ? "Scanning..." : "Scan inbox"}
-        </button>
+        <div className="flex gap-3">
+          <button onClick={() => clientSideGmailScan({ scanFn, qc, setConnecting })} disabled={connecting} className="btn-acid">
+            <Mail className="w-4 h-4" />
+            {connecting ? "Connecting..." : "Connect Gmail & Scan"}
+          </button>
+          <button onClick={() => scan.mutate()} disabled={scan.isPending} className="btn-ghost">
+            <RefreshCw className={`w-4 h-4 ${scan.isPending ? "animate-spin" : ""}`} />
+            {scan.isPending ? "Scanning..." : "Scan inbox"}
+          </button>
+        </div>
       </div>
 
       <div className="grid md:grid-cols-3 gap-6 mb-12">
