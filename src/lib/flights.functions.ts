@@ -48,7 +48,7 @@ function extractDateFromText(text: string, defaultYear: string): string | null {
   m = text.match(/\b(3[01]|[12]\d|0?[1-9])[-/](1[0-2]|0?[1-9])[-/](202[3-9])\b/);
   if (m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
 
-  const months = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SET","OCT","NOV","DEC"];
+  const months = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
   const monthRegex = months.join("|");
   const ddmmyyyy = new RegExp(`\\b(3[01]|[12]\\d|0?[1-9])\\s+(${monthRegex})[A-Z]*\\s*(202[3-9])?\\b`, 'i');
   m = text.match(ddmmyyyy);
@@ -229,14 +229,27 @@ function parseMicrodataBlock(block: string): ParsedFlight | null {
   };
 }
 
-// ─── UNIVERSAL PARSER ────────────────────────────────────────────────────────
+// ─── UNIVERSAL PARSER WITH TELEMETRY ──────────────────────────────────────────
 
-function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDate: string | null = null): ParsedFlight[] {
+interface DiagnosticReport {
+  subject: string;
+  hasStructuredData: boolean;
+  detectedFlightMatches: string[];
+  extractedAirportsInChunk: string[];
+  extractedDate: string | null;
+  outcome: string;
+}
+
+function parseFlightsWithTelemetry(
+  payload: any, 
+  subject: string, 
+  fallbackDate: string | null,
+  logBucket: DiagnosticReport[]
+): ParsedFlight[] {
   const html = getHtml(payload);
   if (!html) return [];
   
   let flights: ParsedFlight[] = [];
-  
   if (html.includes("application/ld+json")) flights = flights.concat(extractJsonLd(html));
   if (html.includes("FlightReservation")) flights = flights.concat(extractMicrodata(html));
 
@@ -245,30 +258,33 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
                             .replace(/<[^>]+>/g, ' ');
   
   const combinedText = `${subject} ${rawTextOriginal}`;
-  const defaultYear = fallbackDate ? fallbackDate.substring(0, 4) : new Date().getFullYear().toString();
+  const defaultYear = fallbackDate ? fallbackDate.substring(0, 4) : "2026";
 
-  // 1. Structured Data Found Path
+  // Case 1: Standard structured data path
   if (flights.length > 0) {
     for (const f of flights) {
       if (!f.arrival_airport || !f.departure_airport) {
         const foundAirports = [...combinedText.matchAll(/\b([A-Z]{3})\b/g)]
           .map(m => m[1]).filter(code => VALID_IATA_CODES.has(code));
-
         if (foundAirports.length > 0) {
           if (!f.departure_airport) f.departure_airport = foundAirports[0];
-          if (!f.arrival_airport && foundAirports.length > 1) {
-            f.arrival_airport = foundAirports.find(a => a !== f.departure_airport) || null;
-          }
+          if (!f.arrival_airport && foundAirports.length > 1) f.arrival_airport = foundAirports[1];
         }
       }
-      if (!f.departure_date) {
-        f.departure_date = extractDateFromText(combinedText.toUpperCase(), defaultYear) || fallbackDate;
-      }
+      if (!f.departure_date) f.departure_date = extractDateFromText(combinedText, defaultYear) || fallbackDate;
     }
+    logBucket.push({
+      subject,
+      hasStructuredData: true,
+      detectedFlightMatches: flights.map(f => f.flight_number),
+      extractedAirportsInChunk: flights.map(f => `${f.departure_airport}->${f.arrival_airport}`),
+      extractedDate: flights[0]?.departure_date,
+      outcome: "SUCCESS (Structured Data)"
+    });
     return flights;
   }
 
-  // 2. Pure Text Fallback Path (KLM, EasyJet, etc.)
+  // Case 2: Text fallback path
   const validCodes = Object.keys(AIRLINE_NAMES).join('|');
   const flightRegex = new RegExp(`\\b(${validCodes})\\s*(\\d{2,4})\\b`, 'gi');
   const flightMatches = [...combinedText.matchAll(flightRegex)];
@@ -279,43 +295,61 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
     for (const m of flightMatches) {
       const chunk = combinedText.substring(Math.max(0, m.index! - 150), Math.min(combinedText.length, m.index! + 150));
       
-      // Look for clean structural routing codes (e.g. AMS-MAD, AMS/MAD, MAD TO AMS)
-      // This stops conversational acronyms like "SEA" from breaking routes
-      let localAirports = [...chunk.matchAll(/\b([A-Z]{3})\s*[-/→to]*\s*\b([A-Z]{3})\b/gi)]
-        .flatMap(match => [match[1].toUpperCase(), match[2].toUpperCase()])
+      const localAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
+        .map(a => a[1].toUpperCase())
         .filter(code => VALID_IATA_CODES.has(code));
 
-      // If no explicit route syntax found, drop back to standard proximity scanning
-      if (localAirports.length < 2) {
-        localAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
-          .map(a => a[1].toUpperCase())
-          .filter(code => VALID_IATA_CODES.has(code));
-      }
-
-      let flightDate = extractDateFromText(chunk.toUpperCase(), defaultYear);
-      if (!flightDate) flightDate = extractDateFromText(combinedText.toUpperCase(), defaultYear);
-      if (!flightDate) flightDate = fallbackDate; // Safety Fallback
+      let flightDate = extractDateFromText(chunk, defaultYear);
+      if (!flightDate) flightDate = extractDateFromText(combinedText, defaultYear);
+      if (!flightDate) flightDate = fallbackDate;
 
       if (localAirports.length >= 2 && flightDate) {
         const iata = m[1].toUpperCase();
         const num = m[2];
         const flightNumber = `${iata}${num}`;
 
-        if (!uniqueFlights.has(flightNumber)) {
-           uniqueFlights.set(flightNumber, {
-             flight_number: flightNumber,
-             airline: AIRLINE_NAMES[iata] || iata,
-             departure_airport: localAirports[0],
-             arrival_airport: localAirports.find(a => a !== localAirports[0]) || null,
-             departure_date: flightDate
-           });
-        }
+        uniqueFlights.set(flightNumber, {
+          flight_number: flightNumber,
+          airline: AIRLINE_NAMES[iata] || iata,
+          departure_airport: localAirports[0],
+          arrival_airport: localAirports.find(a => a !== localAirports[0]) || null,
+          departure_date: flightDate
+        });
+      } else {
+        logBucket.push({
+          subject,
+          hasStructuredData: false,
+          detectedFlightMatches: [m[0]],
+          extractedAirportsInChunk: localAirports,
+          extractedDate: flightDate,
+          outcome: `DROPPED (Required 2 airports and date inside chunk. Found airports: ${localAirports.length}, Date: ${flightDate ? "YES" : "NO"})`
+        });
       }
     }
-    return Array.from(uniqueFlights.values());
+    
+    if (uniqueFlights.size > 0) {
+      const finalFlights = Array.from(uniqueFlights.values());
+      logBucket.push({
+        subject,
+        hasStructuredData: false,
+        detectedFlightMatches: finalFlights.map(f => f.flight_number),
+        extractedAirportsInChunk: finalFlights.map(f => `${f.departure_airport}->${f.arrival_airport}`),
+        extractedDate: finalFlights[0]?.departure_date,
+        outcome: "SUCCESS (Text Fallback)"
+      });
+      return finalFlights;
+    }
   }
 
-  return flights;
+  logBucket.push({
+    subject,
+    hasStructuredData: false,
+    detectedFlightMatches: [],
+    extractedAirportsInChunk: [],
+    extractedDate: null,
+    outcome: "SKIPPED (No flight pattern found)"
+  });
+  return [];
 }
 
 // ─── MAIN SCAN ────────────────────────────────────────────────────────────────
@@ -331,13 +365,11 @@ export const scanGmail = createServerFn({ method: "POST" })
     const googleToken = profileData?.gmail_access_token;
     if (!googleToken) return { detected: 0, inserted: 0, error: "No Gmail token — sign out and back in" };
 
-    // FIX: Removed the older_than:300d time-gate. It now searches the entire frame up to today.
     const threadsRes = await fetch(
       `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=85`,
       { headers: { Authorization: `Bearer ${googleToken}` } }
     );
     if (!threadsRes.ok) {
-      if (threadsRes.status === 401) return { detected: 0, inserted: 0, error: "Gmail token expired — sign out and back in" };
       return { detected: 0, inserted: 0, error: `Gmail error ${threadsRes.status}` };
     }
     const threads: any[] = (await threadsRes.json()).threads ?? [];
@@ -365,16 +397,13 @@ export const scanGmail = createServerFn({ method: "POST" })
       threadMessageIds.push({ threadId: thread.id, messageIds: ids });
     }
 
-    if (!threadMessageIds.length) return { detected: threads.length, inserted: 0, error: "No flight threads found" };
-
-    const allFirstIds = threadMessageIds.map(t => t.messageIds[0]);
     const firstBatch = await gmailBatch(
-      allFirstIds.map(id => ({ id, path: `/gmail/v1/users/me/messages/${id}?format=full` })),
+      threadMessageIds.map(t => ({ id: t.messageIds[0], path: `/gmail/v1/users/me/messages/${t.messageIds[0]}?format=full` })),
       googleToken
     );
 
     const flightMap = new Map<string, ParsedFlight>();
-    const threadsNeedingFallback: string[] = [];
+    const deepTelemetry: DiagnosticReport[] = [];
 
     for (const { threadId, messageIds } of threadMessageIds) {
       const msgData = firstBatch.get(messageIds[0]);
@@ -387,16 +416,10 @@ export const scanGmail = createServerFn({ method: "POST" })
         fallbackDate = new Date(parseInt(msgData.internalDate)).toISOString().split("T")[0];
       }
       
-      const flights = parseFlightsFromPayload(msgData.payload, subject, fallbackDate);
-      
-      if (flights.length === 0 && messageIds.length > 1) {
-        threadsNeedingFallback.push(...messageIds.slice(1));
-        continue;
-      }
+      const flights = parseFlightsWithTelemetry(msgData.payload, subject, fallbackDate, deepTelemetry);
       
       for (const f of flights) {
-        if (!f.flight_number || !f.departure_date) continue; // Must be valid data
-        
+        if (!f.flight_number || !f.departure_date) continue;
         const cleanFlight = normalizeFlightNumber(f.flight_number);
         const key = `${cleanFlight}-${f.departure_date}`;
         
@@ -412,16 +435,10 @@ export const scanGmail = createServerFn({ method: "POST" })
       }
     }
 
-    const debugData = {
-      threadsWithNoStructuredData: threadsNeedingFallback.length,
-      flightMapKeys: [...flightMap.keys()]
-    };
-
-    if (!flightMap.size) {
-      return { detected: threads.length, inserted: 0, error: "No flight data detected", debug: debugData };
+    const validFlights = [...flightMap.values()];
+    if (validFlights.length === 0) {
+      return { detected: threads.length, inserted: 0, error: "No flights parsed", debug: { deepTelemetry } };
     }
-
-    const validFlights = [...flightMap.values()].filter(f => f.departure_date !== null);
 
     const toInsert = validFlights.map(f => ({
       user_id:           userId,
@@ -432,20 +449,14 @@ export const scanGmail = createServerFn({ method: "POST" })
       departure_date:    f.departure_date,
     }));
 
-    if (toInsert.length === 0) {
-      return { detected: threads.length, parsed: validFlights.length, inserted: 0, error: "No flights with valid dates found.", debug: debugData };
-    }
-
-    const { error: rpcErr } = await (supabase as any).rpc("upsert_flights", {
-      p_flights: toInsert,
-    });
+    const { error: rpcErr } = await (supabase as any).rpc("upsert_flights", { p_flights: toInsert });
 
     return {
       detected: threads.length,
       parsed: toInsert.length,
       inserted: toInsert.length,
       error: rpcErr?.message ?? null,
-      debug: debugData,
+      debug: { deepTelemetry },
     };
   });
 
@@ -461,9 +472,7 @@ export const listFlights = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const { supabase, userId } = context;
-    const { data, error } = await (supabase as any)
-      .from("flights").select("*").eq("user_id", userId)
-      .order("departure_date", { ascending: false });
+    const { data, error } = await (supabase as any).from("flights").select("*").eq("user_id", userId).order("departure_date", { ascending: false });
     if (error) throw new Error(error.message);
     return data ?? [];
   });
@@ -472,10 +481,7 @@ export const listClaims = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const { supabase, userId } = context;
-    const { data, error } = await (supabase as any)
-      .from("claims")
-      .select("*, flights(airline, flight_number, departure_airport, arrival_airport, departure_date)")
-      .eq("user_id", userId).order("filed_at", { ascending: false });
+    const { data, error } = await (supabase as any).from("claims").select("*, flights(airline, flight_number, departure_airport, arrival_airport, departure_date)").eq("user_id", userId).order("filed_at", { ascending: false });
     if (error) throw new Error(error.message);
     return data ?? [];
   });
@@ -484,8 +490,7 @@ export const getProfile = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const { supabase, userId } = context;
-    const { data, error } = await (supabase as any)
-      .from("profiles").select("*").eq("id", userId).maybeSingle();
+    const { data, error } = await (supabase as any).from("profiles").select("*").eq("id", userId).maybeSingle();
     if (error) throw new Error(error.message);
     return data;
   });
