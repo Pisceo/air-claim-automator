@@ -1,19 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 
-const AIRLINE_DOMAINS = [
-  "ryanair.com", "easyjet.com", "wizzair.com", "vueling.com",
-  "klm.com", "klm-info.com", "airfrance.com", "lufthansa.com", "iberia.com",
-  "britishairways.com", "transavia.com", "norwegian.com", "tap.pt",
-  "turkishairlines.com", "thy.com", "emirates.com", "aireuropa.com",
-  "united.com", "delta.com", "aa.com", "qatarairways.com",
-  "etihad.com", "flysas.com", "finnair.com", "lot.com", "swiss.com",
-  "austrian.com", "brusselsairlines.com", "airbaltic.com",
-  "flydubai.com", "condor.com", "volotea.com",
-  "edreams.com", "kiwi.com", "opodo.com", "lastminute.com",
-  "bravofly.com", "trip.com", "expedia.com",
-];
-
 // ─── DECODE ──────────────────────────────────────────────────────────────────
 
 function base64Decode(str: string): string {
@@ -27,119 +14,203 @@ function base64Decode(str: string): string {
   }
 }
 
-function extractText(payload: any, depth = 0): string {
-  if (depth > 4) return "";
-  let text = "";
+function getHtmlParts(payload: any, depth = 0): string[] {
+  if (depth > 4) return [];
+  const parts: string[] = [];
+  if (payload?.mimeType === "text/html" && payload?.body?.data) {
+    try { parts.push(base64Decode(payload.body.data)); } catch { /* skip */ }
+  }
   if (payload?.parts) {
     for (const p of payload.parts) {
-      if ((p.mimeType === "text/plain" || p.mimeType === "text/html") && p.body?.data) {
-        try {
-          const decoded = base64Decode(p.body.data);
-          // Strip HTML tags if HTML
-          text += p.mimeType === "text/html"
-            ? decoded.replace(/<style[\s\S]*?<\/style>/gi, "")
-                     .replace(/<script[\s\S]*?<\/script>/gi, "")
-                     .replace(/<[^>]+>/g, " ")
-                     .replace(/\s+/g, " ")
-                     .slice(0, 1500)
-            : decoded.slice(0, 1500);
-          text += "\n";
-        } catch { /* skip */ }
+      if (p.mimeType === "text/html" && p.body?.data) {
+        try { parts.push(base64Decode(p.body.data)); } catch { /* skip */ }
       } else if (p.mimeType?.startsWith("multipart/")) {
-        text += extractText(p, depth + 1);
+        parts.push(...getHtmlParts(p, depth + 1));
       }
     }
-  } else if (payload?.body?.data) {
-    try { text += base64Decode(payload.body.data).slice(0, 1500); } catch { /* skip */ }
   }
-  return text.slice(0, 2000);
+  return parts;
 }
 
-// ─── AI EXTRACTION ───────────────────────────────────────────────────────────
+// ─── STRUCTURED DATA EXTRACTION ──────────────────────────────────────────────
 
-interface ExtractedFlight {
+interface ParsedFlight {
   flight_number: string;
   airline: string;
   departure_airport: string | null;
   arrival_airport: string | null;
-  departure_date: string | null; // YYYY-MM-DD
+  departure_date: string | null;
 }
 
-async function extractFlightsWithAI(emails: { subject: string; from: string; body: string }[]): Promise<ExtractedFlight[]> {
-  const emailList = emails.map((e, i) =>
-    `EMAIL ${i + 1}:\nFrom: ${e.from}\nSubject: ${e.subject}\nBody: ${e.body}`
-  ).join("\n\n---\n\n");
+// Strategy 1: JSON-LD <script type="application/ld+json">
+// Used by: Qatar Airways, some Iberia emails, United, KLM booking confirmations
+function extractJsonLd(html: string): ParsedFlight[] {
+  const results: ParsedFlight[] = [];
+  const scripts = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
 
-  const prompt = `You are extracting flight booking data from airline emails. For each email, extract ALL actual flights (not promotional content).
+  for (const s of scripts) {
+    try {
+      const json = JSON.parse(s[1].trim());
+      const items = Array.isArray(json) ? json : [json];
+      for (const item of items) {
+        const nodes = item["@graph"] ? item["@graph"] : [item];
+        for (const node of nodes) {
+          // Handle both FlightReservation and direct arrays
+          const reservations = Array.isArray(node) ? node : [node];
+          for (const res of reservations) {
+            const f = parseJsonLdReservation(res);
+            if (f) results.push(f);
+          }
+        }
+      }
+    } catch { /* invalid JSON */ }
+  }
+  return results;
+}
 
-Return ONLY a JSON array. Each object must have:
-- flight_number: string like "IB740" or "KL1500" (airline IATA code + number, NO leading zeros e.g. IB740 not IB0740)
-- airline: full airline name
-- departure_airport: IATA code (3 letters) or null
-- arrival_airport: IATA code (3 letters) or null  
-- departure_date: "YYYY-MM-DD" format or null
+function parseJsonLdReservation(node: any): ParsedFlight | null {
+  if (!node || typeof node !== "object") return null;
 
-Rules:
-- Only include REAL flights the person booked (not advertised flights)
-- Strip leading zeros from flight numbers (IB0740 → IB740, KL1500 stays KL1500)
-- If an email has multiple legs (layovers), include each leg as a separate flight
-- If you cannot determine a field with confidence, use null
-- Ignore promotional emails, miles/points emails, surveys
-- If no flights found in an email, skip it
-
-Emails to process:
-${emailList}
-
-Return ONLY valid JSON array, no other text:`;
-
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "anthropic-version": "2023-06-01",
-      "anthropic-dangerous-direct-browser-access": "true",
-    },
-    body: JSON.stringify({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 2000,
-      messages: [{ role: "user", content: prompt }],
-    }),
-  });
-
-  if (!response.ok) {
-    console.error("Claude API error:", response.status, await response.text());
-    return [];
+  // Handle ReservationPackage containing multiple FlightReservations
+  if (Array.isArray(node.subReservation)) {
+    const flights: ParsedFlight[] = [];
+    for (const sub of node.subReservation) {
+      const f = parseJsonLdReservation(sub);
+      if (f) flights.push(f);
+    }
+    return flights[0] ?? null; // Return first, rest handled by loop
   }
 
-  const data = await response.json();
-  const text = data.content?.[0]?.text ?? "";
+  const rf = node.reservationFor;
+  if (!rf) return null;
 
-  try {
-    // Strip any markdown fences just in case
-    const clean = text.replace(/```json\n?/g, "").replace(/```\n?/g, "").trim();
-    const parsed = JSON.parse(clean);
-    if (!Array.isArray(parsed)) return [];
+  const iataCode = (rf.airline?.iataCode ?? rf.operatingAirline?.iataCode ?? "").toUpperCase();
+  const rawNum = String(rf.flightNumber ?? "").replace(/\D/g, "");
+  if (!iataCode || !rawNum) return null;
 
-    // Validate and normalise each flight
-    return parsed.filter((f: any) => {
-      if (!f.flight_number || typeof f.flight_number !== "string") return false;
-      if (!f.airline || typeof f.airline !== "string") return false;
-      // Must have at least a flight number
-      return f.flight_number.match(/^[A-Z]{2}\d{1,4}$/);
-    }).map((f: any) => ({
-      flight_number: f.flight_number.toUpperCase(),
-      airline: f.airline,
-      departure_airport: typeof f.departure_airport === "string" && f.departure_airport.length === 3
-        ? f.departure_airport.toUpperCase() : null,
-      arrival_airport: typeof f.arrival_airport === "string" && f.arrival_airport.length === 3
-        ? f.arrival_airport.toUpperCase() : null,
-      departure_date: typeof f.departure_date === "string" && f.departure_date.match(/^\d{4}-\d{2}-\d{2}$/)
-        ? f.departure_date : null,
-    }));
-  } catch (e) {
-    console.error("Failed to parse Claude response:", text, e);
-    return [];
+  const flightNum = parseInt(rawNum, 10);
+  if (isNaN(flightNum)) return null;
+
+  const dep = (rf.departureAirport?.iataCode ?? "").toUpperCase();
+  const arr = (rf.arrivalAirport?.iataCode ?? "").toUpperCase();
+
+  let date: string | null = null;
+  if (rf.departureTime) {
+    const d = new Date(rf.departureTime);
+    if (!isNaN(d.getTime())) date = d.toISOString().split("T")[0];
   }
+
+  const AIRLINE_NAMES: Record<string, string> = {
+    IB: "Iberia", KL: "KLM", QR: "Qatar Airways", TK: "Turkish Airlines",
+    UA: "United", BA: "British Airways", FR: "Ryanair", U2: "easyJet",
+    VY: "Vueling", AF: "Air France", LH: "Lufthansa", EK: "Emirates",
+    W6: "Wizz Air", HV: "Transavia", DY: "Norwegian", TP: "TAP",
+    UX: "Air Europa", DL: "Delta", AA: "American", QR2: "Qatar Airways",
+    EY: "Etihad", SK: "SAS", AY: "Finnair", LO: "LOT", LX: "SWISS",
+    OS: "Austrian", SN: "Brussels Airlines", V7: "Volotea", BT: "airBaltic",
+  };
+
+  return {
+    flight_number: `${iataCode}${flightNum}`,
+    airline: rf.airline?.name ?? AIRLINE_NAMES[iataCode] ?? iataCode,
+    departure_airport: dep.length === 3 ? dep : null,
+    arrival_airport: arr.length === 3 ? arr : null,
+    departure_date: date,
+  };
+}
+
+// Strategy 2: HTML Microdata (itemprop)
+// Used by: Iberia boarding passes, Turkish Airlines, United check-in emails
+// This is what powers the Google flight widgets in Gmail
+function extractMicrodata(html: string): ParsedFlight[] {
+  const results: ParsedFlight[] = [];
+
+  // Find every FlightReservation block boundary
+  const openRe = /<[^>]+itemtype=["'][^"']*FlightReservation["'][^>]*>/gi;
+  const opens = [...html.matchAll(openRe)];
+  if (!opens.length) return [];
+
+  for (const open of opens) {
+    const blockStart = (open.index ?? 0) + open[0].length;
+
+    // Walk forward counting div depth to find end of block
+    let depth = 1;
+    let pos = blockStart;
+    while (pos < html.length && depth > 0) {
+      const nextOpen  = html.indexOf("<div",  pos);
+      const nextClose = html.indexOf("</div", pos);
+      if (nextClose === -1) break;
+      if (nextOpen !== -1 && nextOpen < nextClose) {
+        depth++;
+        pos = nextOpen + 4;
+      } else {
+        depth--;
+        pos = nextClose + 6;
+      }
+    }
+
+    const block = html.slice(blockStart, pos);
+    const f = parseMicrodataBlock(block);
+    if (f) results.push(f);
+  }
+
+  return results;
+}
+
+function parseMicrodataBlock(block: string): ParsedFlight | null {
+  function getMeta(prop: string): string {
+    const r1 = block.match(new RegExp(`itemprop=["']${prop}["'][^>]*content=["']([^"'<>]+)["']`, "i"));
+    const r2 = block.match(new RegExp(`content=["']([^"'<>]+)["'][^>]*itemprop=["']${prop}["']`, "i"));
+    return (r1 ?? r2)?.[1]?.trim() ?? "";
+  }
+
+  // Collect all iataCode values IN ORDER — airline code first, then dep, then arr
+  const allIata = [
+    ...block.matchAll(/itemprop=["']iataCode["'][^>]*content=["']([A-Z]{2,3})["']/gi),
+    ...block.matchAll(/content=["']([A-Z]{2,3})["'][^>]*itemprop=["']iataCode["']/gi),
+  ].map(m => m[1].toUpperCase());
+
+  // Deduplicate preserving order
+  const seen = new Set<string>();
+  const codes = allIata.filter(c => { if (seen.has(c)) return false; seen.add(c); return true; });
+
+  if (codes.length < 1) return null;
+
+  const airlineCode = codes[0];
+  // Airline codes are 2 chars, airport codes are 3 chars
+  const airports = codes.filter(c => c.length === 3);
+  const dep = airports[0] ?? null;
+  const arr = airports[1] ?? null;
+
+  const rawNum = getMeta("flightNumber").replace(/\D/g, "");
+  if (!rawNum) return null;
+  const flightNum = parseInt(rawNum, 10);
+  if (isNaN(flightNum) || airlineCode.length !== 2) return null;
+
+  const depTime = getMeta("departureTime");
+  let date: string | null = null;
+  if (depTime) {
+    const d = new Date(depTime);
+    if (!isNaN(d.getTime())) date = d.toISOString().split("T")[0];
+  }
+
+  const AIRLINE_NAMES: Record<string, string> = {
+    IB: "Iberia", KL: "KLM", QR: "Qatar Airways", TK: "Turkish Airlines",
+    UA: "United", BA: "British Airways", FR: "Ryanair", U2: "easyJet",
+    VY: "Vueling", AF: "Air France", LH: "Lufthansa", EK: "Emirates",
+    W6: "Wizz Air", HV: "Transavia", DY: "Norwegian", TP: "TAP",
+    UX: "Air Europa", DL: "Delta", AA: "American", EY: "Etihad",
+    SK: "SAS", AY: "Finnair", LO: "LOT", LX: "SWISS", OS: "Austrian",
+    SN: "Brussels Airlines", V7: "Volotea", BT: "airBaltic",
+  };
+
+  return {
+    flight_number: `${airlineCode}${flightNum}`,
+    airline: AIRLINE_NAMES[airlineCode] ?? airlineCode,
+    departure_airport: dep,
+    arrival_airport: arr,
+    departure_date: date,
+  };
 }
 
 // ─── MAIN SCAN ────────────────────────────────────────────────────────────────
@@ -155,39 +226,29 @@ export const scanGmail = createServerFn({ method: "POST" })
     const googleToken = profileData?.gmail_access_token;
     if (!googleToken) return { detected: 0, inserted: 0, error: "No Gmail token — sign out and back in" };
 
-    // ── Step 1: Two parallel Gmail searches (2 subrequests) ──────────────────
-    const domainQuery = AIRLINE_DOMAINS.map(d => `from:${d}`).join(" OR ");
-    const q1 = `(${domainQuery}) (subject:booking OR subject:confirmation OR subject:reservation OR subject:"your trip" OR subject:itinerary OR subject:"e-ticket" OR subject:"online ticket") newer_than:1095d`;
-    const q2 = `(${domainQuery}) (subject:"boarding pass" OR subject:"check in" OR subject:checkin OR subject:"ready to fly" OR subject:"hatirlatma") newer_than:1095d`;
+    // ── Step 1: Fetch emails from category:reservations ───────────────────
+    // This is Gmail's own booking/reservation category — filters out all
+    // promotional emails, newsletters, and marketing automatically.
+    // It's the same filter that powers Google's trip detection.
+    const listRes = await fetch(
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=40`,
+      { headers: { Authorization: `Bearer ${googleToken}` } }
+    );
 
-    const [r1, r2] = await Promise.all([
-      fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q1)}&maxResults=18`, { headers: { Authorization: `Bearer ${googleToken}` } }),
-      fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q2)}&maxResults=12`, { headers: { Authorization: `Bearer ${googleToken}` } }),
-    ]);
-
-    if (!r1.ok && !r2.ok) {
-      if (r1.status === 401) return { detected: 0, inserted: 0, error: "Gmail token expired — sign out and back in" };
-      return { detected: 0, inserted: 0, error: `Gmail error ${r1.status}` };
+    if (!listRes.ok) {
+      if (listRes.status === 401) return { detected: 0, inserted: 0, error: "Gmail token expired — sign out and back in" };
+      return { detected: 0, inserted: 0, error: `Gmail error ${listRes.status}` };
     }
 
-    const [d1, d2] = await Promise.all([
-      r1.ok ? r1.json() : { messages: [] },
-      r2.ok ? r2.json() : { messages: [] },
-    ]);
+    const listData = await listRes.json();
+    const messages: any[] = listData.messages ?? [];
+    if (!messages.length) return { detected: 0, inserted: 0, error: "No reservation emails found" };
 
-    // Deduplicate message IDs
-    const seenIds = new Set<string>();
-    const messages: any[] = [];
-    for (const m of [...(d1.messages ?? []), ...(d2.messages ?? [])]) {
-      if (!seenIds.has(m.id)) { seenIds.add(m.id); messages.push(m); }
-    }
+    // ── Step 2: Fetch and parse each email ────────────────────────────────
+    // Budget: 1 (list) + up to 35 (full fetch) + 1 (delete) + 1 (insert) = 38
+    const flightMap = new Map<string, ParsedFlight>();
 
-    if (!messages.length) return { detected: 0, inserted: 0, error: "No matching emails found" };
-
-    // ── Step 2: Fetch full email content (up to 30 subrequests) ──────────────
-    const emailContents: { subject: string; from: string; body: string }[] = [];
-
-    for (const msg of messages.slice(0, 30)) {
+    for (const msg of messages.slice(0, 35)) {
       try {
         const res = await fetch(
           `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
@@ -196,60 +257,67 @@ export const scanGmail = createServerFn({ method: "POST" })
         if (!res.ok) continue;
         const full = await res.json();
 
-        const hdrs    = full.payload?.headers ?? [];
-        const subject = hdrs.find((h: any) => h.name === "Subject")?.value ?? "";
-        const from    = hdrs.find((h: any) => h.name === "From")?.value ?? "";
+        const htmlParts = getHtmlParts(full.payload);
+        const fullHtml = htmlParts.join("\n");
+        if (!fullHtml) continue;
 
-        // Skip obvious noise
-        const subj = subject.toLowerCase();
-        if (["survey", "newsletter", "unsubscribe", "miles earned", "points earned",
-             "feedback", "satisfaction", "miles&smiles", "new login", "security alert",
-             "password", "invoice", "receipt"].some(w => subj.includes(w))) continue;
+        // Try JSON-LD first (Qatar Airways, some KLM, some United)
+        let parsed: ParsedFlight[] = [];
 
-        const body = extractText(full.payload);
-        emailContents.push({ subject, from, body });
+        if (fullHtml.includes("application/ld+json")) {
+          parsed = extractJsonLd(fullHtml);
+        }
+
+        // Try microdata if JSON-LD found nothing (Iberia, Turkish, most others)
+        if (!parsed.length && fullHtml.includes("FlightReservation")) {
+          parsed = extractMicrodata(fullHtml);
+        }
+
+        // Deduplicate into map
+        for (const f of parsed) {
+          if (!f.flight_number) continue;
+          const key = `${f.flight_number}-${f.departure_date ?? "nodate"}`;
+          if (!flightMap.has(key)) {
+            flightMap.set(key, f);
+          } else {
+            // Enrich existing record with any missing fields
+            const ex = flightMap.get(key)!;
+            if (!ex.departure_airport && f.departure_airport) ex.departure_airport = f.departure_airport;
+            if (!ex.arrival_airport   && f.arrival_airport)   ex.arrival_airport   = f.arrival_airport;
+            if (!ex.departure_date    && f.departure_date)    ex.departure_date    = f.departure_date;
+          }
+        }
       } catch { continue; }
     }
 
-    if (!emailContents.length) return { detected: 0, inserted: 0, error: "No flight emails to process" };
-
-    // ── Step 3: One Claude API call to extract all flights (1 subrequest) ────
-    const aiFlights = await extractFlightsWithAI(emailContents);
-
-    if (!aiFlights.length) return { detected: messages.length, inserted: 0, error: "No flights found in emails" };
-
-    // ── Step 4: Deduplicate by flight_number + departure_date ─────────────────
-    const flightMap = new Map<string, any>();
-    for (const f of aiFlights) {
-      if (!f.flight_number || !f.departure_date) continue;
-      const key = `${f.flight_number}-${f.departure_date}`;
-      if (!flightMap.has(key)) {
-        flightMap.set(key, { user_id: userId, ...f });
-      } else {
-        const ex = flightMap.get(key)!;
-        if (!ex.departure_airport && f.departure_airport) ex.departure_airport = f.departure_airport;
-        if (!ex.arrival_airport && f.arrival_airport) ex.arrival_airport = f.arrival_airport;
-      }
+    if (!flightMap.size) {
+      return {
+        detected: messages.length,
+        inserted: 0,
+        error: "Emails found but no structured flight data detected. Airlines may not include Schema.org markup.",
+      };
     }
 
-    const toUpsert = [...flightMap.values()];
+    // ── Step 3: Write to database ─────────────────────────────────────────
+    const toInsert = [...flightMap.values()].map(f => ({
+      user_id: userId,
+      flight_number:      f.flight_number,
+      airline:            f.airline,
+      departure_airport:  f.departure_airport,
+      arrival_airport:    f.arrival_airport,
+      departure_date:     f.departure_date,
+    }));
 
-    // ── Step 5: Clear old flights and upsert new ones (1 subrequest) ──────────
     await (supabase as any).from("flights").delete().eq("user_id", userId);
 
-    let actuallyInserted = 0;
-    let insertError = null;
+    const { data: ins, error: insErr } = await (supabase as any)
+      .from("flights").insert(toInsert).select();
 
-    if (toUpsert.length) {
-      const { data: ins, error: insErr } = await (supabase as any)
-        .from("flights")
-        .upsert(toUpsert, { onConflict: "user_id,flight_number,departure_date", ignoreDuplicates: false })
-        .select();
-      if (insErr) insertError = insErr.message;
-      else actuallyInserted = ins?.length ?? 0;
-    }
-
-    return { detected: messages.length, parsed: toUpsert.length, inserted: actuallyInserted, error: insertError };
+    return {
+      detected: messages.length,
+      inserted: ins?.length ?? 0,
+      error: insErr?.message ?? null,
+    };
   });
 
 export const clearAndRescan = createServerFn({ method: "POST" })
