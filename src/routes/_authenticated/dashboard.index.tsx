@@ -120,6 +120,15 @@ function Stat({ label, value, accent }: { label: string; value: string; accent?:
 }
 
 export function FlightCard({ flight }: { flight: any }) {
+  // Hardcode the European format DD/MM/YYYY
+  let displayDate = "—";
+  if (flight.departure_date) {
+    const [year, month, day] = flight.departure_date.split("-");
+    if (year && month && day) {
+      displayDate = `${day}/${month}/${year}`;
+    }
+  }
+
   return (
     <div className="card-surface p-5">
       <div className="flex justify-between items-start">
@@ -127,11 +136,7 @@ export function FlightCard({ flight }: { flight: any }) {
           <div className="label">{flight.airline}</div>
           <div className="font-mono text-lg mt-1">{flight.flight_number}</div>
         </div>
-        <span className="label">
-  {flight.departure_date
-    ? new Date(flight.departure_date + "T12:00:00").toLocaleDateString("en-GB", { day: "2-digit", month: "short", year: "numeric" })
-    : "—"}
-      </span>
+        <span className="label font-mono">{displayDate}</span>
       </div>
       <div className="mt-4 flex items-center gap-3 font-display text-3xl">
         <span>{flight.departure_airport ?? "?"}</span>
