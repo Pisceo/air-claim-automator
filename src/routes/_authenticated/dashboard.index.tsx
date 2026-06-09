@@ -30,19 +30,19 @@ function DashboardHome() {
     staleTime: 0,
   });
 
-  const scan = useMutation({
+ const scan = useMutation({
     mutationFn: () => scanFn(),
     onSuccess: async (r: any) => {
-      // Print the raw text bucket directly to your browser console
-      if (r?.debug?.rawTextSamples?.length > 0) {
-        console.log("✈️ RAW TEXT EXTRACTED:");
-        r.debug.rawTextSamples.forEach((sample: string) => console.log(sample));
+      // Stream the deep parsing mechanics directly to the console log
+      if (r?.debug?.deepTelemetry) {
+        console.log("🔬 MECHANICAL DEEP LOG:");
+        console.table(r.debug.deepTelemetry);
       }
 
       if (!r || r.error) {
         toast.error("Scan issue", { description: r?.error || "Server returned no data." });
       } else {
-        toast.success("Inbox scanned", { description: "Check console for raw text." });
+        toast.success("Inbox scanned successfully");
       }
       
       await new Promise(resolve => setTimeout(resolve, 1500));
