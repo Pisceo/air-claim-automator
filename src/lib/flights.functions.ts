@@ -334,17 +334,32 @@ export const scanGmail = createServerFn({ method: "POST" })
     if (!googleToken) return { detected: 0, inserted: 0, error: "No Gmail token — sign out and back in" };
 
     const domainQuery = AIRLINE_DOMAINS.map(d => `from:${d}`).join(" OR ");
-    const listRes = await fetch(
-      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(`(${domainQuery}) newer_than:1095d`)}&maxResults=35`,
-      { headers: { Authorization: `Bearer ${googleToken}` } }
-    );
 
-    if (!listRes.ok) {
-      if (listRes.status === 401) return { detected: 0, inserted: 0, error: "Gmail token expired — sign out and back in" };
-      return { detected: 0, inserted: 0, error: `Gmail error ${listRes.status}` };
+    // Two targeted searches to maximize finding real booking emails
+    // Search 1: booking confirmations (have unique flights, older)
+    const q1 = `(${domainQuery}) (subject:booking OR subject:confirmation OR subject:reservation OR subject:"your trip" OR subject:itinerary OR subject:"e-ticket") newer_than:1095d`;
+    // Search 2: boarding passes (have clean microdata)
+    const q2 = `(${domainQuery}) (subject:"boarding pass" OR subject:"check in" OR subject:checkin OR subject:"ready to fly") newer_than:1095d`;
+
+    const [r1, r2] = await Promise.all([
+      fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q1)}&maxResults=20`, { headers: { Authorization: `Bearer ${googleToken}` } }),
+      fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q2)}&maxResults=13`, { headers: { Authorization: `Bearer ${googleToken}` } }),
+    ]);
+
+    if (!r1.ok && !r2.ok) {
+      if (r1.status === 401) return { detected: 0, inserted: 0, error: "Gmail token expired — sign out and back in" };
+      return { detected: 0, inserted: 0, error: `Gmail error ${r1.status}` };
     }
 
-    const messages: any[] = (await listRes.json()).messages ?? [];
+    const [d1, d2] = await Promise.all([r1.ok ? r1.json() : { messages: [] }, r2.ok ? r2.json() : { messages: [] }]);
+
+    // Deduplicate message IDs — same email can appear in both searches
+    const seenIds = new Set<string>();
+    const messages: any[] = [];
+    for (const m of [...(d1.messages ?? []), ...(d2.messages ?? [])]) {
+      if (!seenIds.has(m.id)) { seenIds.add(m.id); messages.push(m); }
+    }
+
     if (!messages.length) return { detected: 0, inserted: 0, error: "No matching emails found" };
 
     await (supabase as any).from("flights").delete().eq("user_id", userId);
