@@ -127,7 +127,7 @@ const VALID_IATA_CODES = new Set([
   "JNB", "CPT", "CAI", "CMN", "ADD", "NBO"
 ]);
 
-// Global city mapper to instantly extract routes from high-confidence subject lines
+// Used to map full city names to IATA codes from subject lines
 const CITY_TO_IATA: Record<string, string> = {
   "MADRID": "MAD", "AMSTERDAM": "AMS", "STANSTED": "STN", "LONDON": "STN",
   "HONG KONG": "HKG", "HONGKONG": "HKG", "ISTANBUL": "IST", "BRUSSELS": "BRU", 
@@ -247,23 +247,28 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
   if (html.includes("application/ld+json")) flights = flights.concat(extractJsonLd(html));
   if (html.includes("FlightReservation")) flights = flights.concat(extractMicrodata(html));
 
+  // Strip HTML and keep original casing to protect global acronyms
   let rawTextOriginal = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
                             .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
                             .replace(/<[^>]+>/g, ' ');
   
   const subjectUpper = subject.toUpperCase();
   const combinedText = `${subjectUpper} ${rawTextOriginal}`;
-  const defaultYear = fallbackDate ? fallbackDate.substring(0, 4) : "2026";
+  const defaultYear = fallbackDate ? fallbackDate.substring(0, 4) : new Date().getFullYear().toString();
 
-  // Phase 1: Scan the subject line for high-confidence explicit city routes
-  const subjectAirports: string[] = [];
+  // FIX 1: ORDER-PRESERVING SUBJECT SCANNER
+  // Records the exact string index where the city appears so we never reverse routes
+  const foundSubjectCities: { code: string; index: number }[] = [];
   for (const [city, code] of Object.entries(CITY_TO_IATA)) {
-    if (subjectUpper.includes(city)) {
-      subjectAirports.push(code);
+    const idx = subjectUpper.indexOf(city);
+    if (idx !== -1) {
+      foundSubjectCities.push({ code, index: idx });
     }
   }
+  // Sort strictly by left-to-right appearance in the sentence
+  foundSubjectCities.sort((a, b) => a.index - b.index);
+  const subjectAirports = foundSubjectCities.map(c => c.code);
 
-  // If structured data exists, patch missing holes using high-confidence subject maps
   if (flights.length > 0) {
     for (const f of flights) {
       if (!f.departure_airport && subjectAirports[0]) f.departure_airport = subjectAirports[0];
@@ -274,17 +279,15 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
           .map(m => m[1].toUpperCase()).filter(code => VALID_IATA_CODES.has(code));
         if (globalAirports.length > 0) {
           if (!f.departure_airport) f.departure_airport = globalAirports[0];
-          if (!f.arrival_airport && globalAirports.length > 1) f.arrival_airport = globalAirports[1];
+          if (!f.arrival_airport && globalAirports.length > 1) f.arrival_airport = globalAirports.find(a => a !== f.departure_airport) || null;
         }
       }
-      if (!f.departure_date) {
-        f.departure_date = extractDateFromText(combinedText.toUpperCase(), defaultYear) || fallbackDate;
-      }
+      if (!f.departure_date) f.departure_date = extractDateFromText(combinedText.toUpperCase(), defaultYear) || fallbackDate;
     }
     return flights;
   }
 
-  // Phase 2: Text Fallback Path (KLM, EasyJet, etc.)
+  // FIX 2 & 3: STRICT ROUTE EXTRACTION FOR PURE TEXT (KLM, UNITED, TURKISH)
   const validCodes = Object.keys(AIRLINE_NAMES).join('|');
   const flightRegex = new RegExp(`\\b(${validCodes})\\s*(\\d{2,4})\\b`, 'gi');
   const flightMatches = [...combinedText.matchAll(flightRegex)];
@@ -292,41 +295,43 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
   if (flightMatches.length > 0) {
     const uniqueFlights = new Map<string, ParsedFlight>();
     
-    // Scan the entire document for valid uppercase IATA codes up front
-    const allBodyAirports = [...rawTextOriginal.matchAll(/\b([A-Z]{3})\b/g)]
-      .map(m => m[1].toUpperCase())
-      .filter(code => VALID_IATA_CODES.has(code) && code !== "SEA"); // Hard block conversational acronym leaks
-
     for (const m of flightMatches) {
-      const iata = m[1].toUpperCase();
-      const num = m[2];
-      const flightNumber = `${iata}${num}`;
-
-      // Set baseline target airports using high-confidence subject line routing map
-      let dep = subjectAirports[0] || null;
-      let arr = subjectAirports[1] || null;
-
-      // If subject line is blind, scan local proximity chunk windows
+      // 200-character chunk to tie airports specifically to the nearest flight number
       const chunk = combinedText.substring(Math.max(0, m.index! - 200), Math.min(combinedText.length, m.index! + 200));
-      let localAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
-        .map(a => a[1].toUpperCase())
-        .filter(code => VALID_IATA_CODES.has(code) && code !== "SEA");
+      
+      // Look explicitly for syntactical pairs (e.g. "MAD-AMS", "HKG to IST", "IAH / SAL")
+      const strictRoutes = [...chunk.matchAll(/\b([A-Z]{3})\s*[-/→: ]+(?:TO\s+)?([A-Z]{3})\b/gi)]
+        .map(match => ({ dep: match[1].toUpperCase(), arr: match[2].toUpperCase() }))
+        .filter(route => VALID_IATA_CODES.has(route.dep) && VALID_IATA_CODES.has(route.arr));
 
-      if (!dep && localAirports[0]) dep = localAirports[0];
-      if (!arr && localAirports.length > 1) arr = localAirports.find(a => a !== dep) || null;
+      let dep = null;
+      let arr = null;
 
-      // If proximity chunk is blind (KLM open-table rows), scale out to the entire text block assets
-      if ((!dep || !arr) && flightMatches.length === 1) {
-        if (!dep && allBodyAirports[0]) dep = allBodyAirports[0];
-        if (!arr && allBodyAirports.length > 1) arr = allBodyAirports.find(a => a !== dep) || null;
+      // Prioritize strict visual pairings (IAH-SAL), then subject line, then proximity guessing
+      if (strictRoutes.length > 0) {
+        dep = strictRoutes[0].dep;
+        arr = strictRoutes[0].arr;
+      } else if (subjectAirports.length >= 2) {
+        dep = subjectAirports[0];
+        arr = subjectAirports[1];
+      } else {
+        const looseAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
+          .map(a => a[1].toUpperCase()).filter(code => VALID_IATA_CODES.has(code));
+        if (looseAirports.length >= 2) {
+          dep = looseAirports[0];
+          arr = looseAirports.find(a => a !== dep) || null;
+        }
       }
 
       let flightDate = extractDateFromText(chunk.toUpperCase(), defaultYear);
       if (!flightDate) flightDate = extractDateFromText(combinedText.toUpperCase(), defaultYear);
       if (!flightDate) flightDate = fallbackDate;
 
-      // Ensure we have a valid structural definition before building database entries
       if (dep && arr && flightDate) {
+        const iata = m[1].toUpperCase();
+        const num = m[2];
+        const flightNumber = `${iata}${num}`;
+
         if (!uniqueFlights.has(flightNumber)) {
            uniqueFlights.set(flightNumber, {
              flight_number: flightNumber,
@@ -358,7 +363,7 @@ export const scanGmail = createServerFn({ method: "POST" })
     if (!googleToken) return { detected: 0, inserted: 0, error: "No Gmail token — sign out and back in" };
 
     const threadsRes = await fetch(
-      `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=85`,
+      `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=100`,
       { headers: { Authorization: `Bearer ${googleToken}` } }
     );
     if (!threadsRes.ok) {
@@ -398,7 +403,6 @@ export const scanGmail = createServerFn({ method: "POST" })
     );
 
     const flightMap = new Map<string, ParsedFlight>();
-    const threadsNeedingFallback: string[] = [];
 
     for (const { threadId, messageIds } of threadMessageIds) {
       const msgData = firstBatch.get(messageIds[0]);
@@ -412,11 +416,6 @@ export const scanGmail = createServerFn({ method: "POST" })
       }
       
       const flights = parseFlightsFromPayload(msgData.payload, subject, fallbackDate);
-      
-      if (flights.length === 0 && messageIds.length > 1) {
-        threadsNeedingFallback.push(...messageIds.slice(1));
-        continue;
-      }
       
       for (const f of flights) {
         if (!f.flight_number || !f.departure_date) continue;
@@ -436,9 +435,9 @@ export const scanGmail = createServerFn({ method: "POST" })
       }
     }
 
-    const validFlights = [...flightMap.values()];
+    const validFlights = [...flightMap.values()].filter(f => f.departure_date !== null);
     if (validFlights.length === 0) {
-      return { detected: threads.length, inserted: 0, error: "No flights detected" };
+      return { detected: threads.length, inserted: 0, error: "No structured flight data found in reservation emails" };
     }
 
     const toInsert = validFlights.map(f => ({
@@ -450,7 +449,9 @@ export const scanGmail = createServerFn({ method: "POST" })
       departure_date:    f.departure_date,
     }));
 
-    const { error: rpcErr } = await (supabase as any).rpc("upsert_flights", { p_flights: toInsert });
+    const { error: rpcErr } = await (supabase as any).rpc("upsert_flights", {
+      p_flights: toInsert,
+    });
 
     return {
       detected: threads.length,
@@ -472,7 +473,9 @@ export const listFlights = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const { supabase, userId } = context;
-    const { data, error } = await (supabase as any).from("flights").select("*").eq("user_id", userId).order("departure_date", { ascending: false });
+    const { data, error } = await (supabase as any)
+      .from("flights").select("*").eq("user_id", userId)
+      .order("departure_date", { ascending: false });
     if (error) throw new Error(error.message);
     return data ?? [];
   });
@@ -481,7 +484,10 @@ export const listClaims = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const { supabase, userId } = context;
-    const { data, error } = await (supabase as any).from("claims").select("*, flights(airline, flight_number, departure_airport, arrival_airport, departure_date)").eq("user_id", userId).order("filed_at", { ascending: false });
+    const { data, error } = await (supabase as any)
+      .from("claims")
+      .select("*, flights(airline, flight_number, departure_airport, arrival_airport, departure_date)")
+      .eq("user_id", userId).order("filed_at", { ascending: false });
     if (error) throw new Error(error.message);
     return data ?? [];
   });
@@ -490,7 +496,8 @@ export const getProfile = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
     const { supabase, userId } = context;
-    const { data, error } = await (supabase as any).from("profiles").select("*").eq("id", userId).maybeSingle();
+    const { data, error } = await (supabase as any)
+      .from("profiles").select("*").eq("id", userId).maybeSingle();
     if (error) throw new Error(error.message);
     return data;
   });
