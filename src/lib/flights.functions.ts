@@ -330,8 +330,27 @@ export const scanGmail = createServerFn({ method: "POST" })
       }
     }
 
+    // 1. Build the debug object BEFORE the early return
+    const debugData = {
+      parseDebug,
+      threadSubjects: [...metaBatch.entries()].slice(0, 40).map(([id, td]) => {
+        const subj = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "Subject")?.value ?? "NO SUBJECT";
+        const from = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "From")?.value ?? "NO FROM";
+        const msgCount = td?.messages?.length ?? 0;
+        return `${subj} | FROM: ${from} | MSGS: ${msgCount}`;
+      }),
+      threadsWithNoStructuredData: threadsNeedingFallback.length,
+      flightMapKeys: [...flightMap.keys()],
+    };
+
+    // 2. Attach the debug object even if it fails
     if (!flightMap.size) {
-      return { detected: threads.length, inserted: 0, error: "No structured flight data found in reservation emails" };
+      return { 
+        detected: threads.length, 
+        inserted: 0, 
+        error: "No structured flight data found in reservation emails",
+        debug: debugData 
+      };
     }
 
     const toInsert = [...flightMap.values()].map(f => ({
@@ -343,8 +362,6 @@ export const scanGmail = createServerFn({ method: "POST" })
       departure_date:    f.departure_date,
     }));
 
-    // Use the SECURITY DEFINER function to bypass RLS
-    // This is safe — the function is scoped to the user_id we pass in
     const { error: rpcErr } = await (supabase as any).rpc("upsert_flights", {
       p_flights: toInsert,
     });
@@ -354,17 +371,7 @@ export const scanGmail = createServerFn({ method: "POST" })
       parsed: toInsert.length,
       inserted: toInsert.length,
       error: rpcErr?.message ?? null,
-      debug: {
-        parseDebug,
-        threadSubjects: [...metaBatch.entries()].slice(0, 40).map(([id, td]) => {
-          const subj = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "Subject")?.value ?? "NO SUBJECT";
-          const from = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "From")?.value ?? "NO FROM";
-          const msgCount = td?.messages?.length ?? 0;
-          return `${subj} | FROM: ${from} | MSGS: ${msgCount}`;
-        }),
-        threadsWithNoStructuredData: threadsNeedingFallback.length,
-        flightMapKeys: [...flightMap.keys()],
-      },
+      debug: debugData,
     };
   });
 
