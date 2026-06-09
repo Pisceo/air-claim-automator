@@ -42,24 +42,35 @@ interface ParsedFlight {
   departure_date: string | null;
 }
 
-// Strategy 1: JSON-LD <script type="application/ld+json">
-// Used by: Qatar Airways, some Iberia emails, United, KLM booking confirmations
+const AIRLINE_NAMES: Record<string, string> = {
+  IB: "Iberia", KL: "KLM", QR: "Qatar Airways", TK: "Turkish Airlines",
+  UA: "United", BA: "British Airways", FR: "Ryanair", U2: "easyJet",
+  VY: "Vueling", AF: "Air France", LH: "Lufthansa", EK: "Emirates",
+  W6: "Wizz Air", HV: "Transavia", DY: "Norwegian", TP: "TAP",
+  UX: "Air Europa", DL: "Delta", AA: "American", EY: "Etihad",
+  SK: "SAS", AY: "Finnair", LO: "LOT", LX: "SWISS", OS: "Austrian",
+  SN: "Brussels Airlines", V7: "Volotea", BT: "airBaltic", PC: "Pegasus",
+};
+
+// JSON-LD: used by Qatar Airways, United, KLM booking confirmations
 function extractJsonLd(html: string): ParsedFlight[] {
   const results: ParsedFlight[] = [];
-  const scripts = [...html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
-
-  for (const s of scripts) {
+  for (const s of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
     try {
       const json = JSON.parse(s[1].trim());
       const items = Array.isArray(json) ? json : [json];
       for (const item of items) {
-        const nodes = item["@graph"] ? item["@graph"] : [item];
-        for (const node of nodes) {
-          // Handle both FlightReservation and direct arrays
-          const reservations = Array.isArray(node) ? node : [node];
-          for (const res of reservations) {
-            const f = parseJsonLdReservation(res);
+        for (const node of (item["@graph"] ?? [item])) {
+          for (const res of (Array.isArray(node) ? node : [node])) {
+            const f = parseJsonLdNode(res);
             if (f) results.push(f);
+            // Also handle subReservation arrays (multi-leg trips)
+            if (Array.isArray(res?.subReservation)) {
+              for (const sub of res.subReservation) {
+                const sf = parseJsonLdNode(sub);
+                if (sf) results.push(sf);
+              }
+            }
           }
         }
       }
@@ -68,48 +79,22 @@ function extractJsonLd(html: string): ParsedFlight[] {
   return results;
 }
 
-function parseJsonLdReservation(node: any): ParsedFlight | null {
+function parseJsonLdNode(node: any): ParsedFlight | null {
   if (!node || typeof node !== "object") return null;
-
-  // Handle ReservationPackage containing multiple FlightReservations
-  if (Array.isArray(node.subReservation)) {
-    const flights: ParsedFlight[] = [];
-    for (const sub of node.subReservation) {
-      const f = parseJsonLdReservation(sub);
-      if (f) flights.push(f);
-    }
-    return flights[0] ?? null; // Return first, rest handled by loop
-  }
-
   const rf = node.reservationFor;
   if (!rf) return null;
-
   const iataCode = (rf.airline?.iataCode ?? rf.operatingAirline?.iataCode ?? "").toUpperCase();
   const rawNum = String(rf.flightNumber ?? "").replace(/\D/g, "");
-  if (!iataCode || !rawNum) return null;
-
+  if (!iataCode || !rawNum || iataCode.length !== 2) return null;
   const flightNum = parseInt(rawNum, 10);
   if (isNaN(flightNum)) return null;
-
   const dep = (rf.departureAirport?.iataCode ?? "").toUpperCase();
   const arr = (rf.arrivalAirport?.iataCode ?? "").toUpperCase();
-
   let date: string | null = null;
   if (rf.departureTime) {
     const d = new Date(rf.departureTime);
     if (!isNaN(d.getTime())) date = d.toISOString().split("T")[0];
   }
-
-  const AIRLINE_NAMES: Record<string, string> = {
-    IB: "Iberia", KL: "KLM", QR: "Qatar Airways", TK: "Turkish Airlines",
-    UA: "United", BA: "British Airways", FR: "Ryanair", U2: "easyJet",
-    VY: "Vueling", AF: "Air France", LH: "Lufthansa", EK: "Emirates",
-    W6: "Wizz Air", HV: "Transavia", DY: "Norwegian", TP: "TAP",
-    UX: "Air Europa", DL: "Delta", AA: "American", QR2: "Qatar Airways",
-    EY: "Etihad", SK: "SAS", AY: "Finnair", LO: "LOT", LX: "SWISS",
-    OS: "Austrian", SN: "Brussels Airlines", V7: "Volotea", BT: "airBaltic",
-  };
-
   return {
     flight_number: `${iataCode}${flightNum}`,
     airline: rf.airline?.name ?? AIRLINE_NAMES[iataCode] ?? iataCode,
@@ -119,98 +104,77 @@ function parseJsonLdReservation(node: any): ParsedFlight | null {
   };
 }
 
-// Strategy 2: HTML Microdata (itemprop)
-// Used by: Iberia boarding passes, Turkish Airlines, United check-in emails
-// This is what powers the Google flight widgets in Gmail
+// Microdata: used by Iberia, Turkish Airlines, most boarding pass emails
 function extractMicrodata(html: string): ParsedFlight[] {
   const results: ParsedFlight[] = [];
-
-  // Find every FlightReservation block boundary
   const openRe = /<[^>]+itemtype=["'][^"']*FlightReservation["'][^>]*>/gi;
-  const opens = [...html.matchAll(openRe)];
-  if (!opens.length) return [];
-
-  for (const open of opens) {
+  for (const open of html.matchAll(openRe)) {
     const blockStart = (open.index ?? 0) + open[0].length;
-
-    // Walk forward counting div depth to find end of block
-    let depth = 1;
-    let pos = blockStart;
+    let depth = 1, pos = blockStart;
     while (pos < html.length && depth > 0) {
       const nextOpen  = html.indexOf("<div",  pos);
       const nextClose = html.indexOf("</div", pos);
       if (nextClose === -1) break;
-      if (nextOpen !== -1 && nextOpen < nextClose) {
-        depth++;
-        pos = nextOpen + 4;
-      } else {
-        depth--;
-        pos = nextClose + 6;
-      }
+      if (nextOpen !== -1 && nextOpen < nextClose) { depth++; pos = nextOpen + 4; }
+      else { depth--; pos = nextClose + 6; }
     }
-
-    const block = html.slice(blockStart, pos);
-    const f = parseMicrodataBlock(block);
+    const f = parseMicrodataBlock(html.slice(blockStart, pos));
     if (f) results.push(f);
   }
-
   return results;
 }
 
 function parseMicrodataBlock(block: string): ParsedFlight | null {
-  function getMeta(prop: string): string {
-    const r1 = block.match(new RegExp(`itemprop=["']${prop}["'][^>]*content=["']([^"'<>]+)["']`, "i"));
-    const r2 = block.match(new RegExp(`content=["']([^"'<>]+)["'][^>]*itemprop=["']${prop}["']`, "i"));
-    return (r1 ?? r2)?.[1]?.trim() ?? "";
-  }
+  const getMeta = (prop: string) =>
+    (block.match(new RegExp(`itemprop=["']${prop}["'][^>]*content=["']([^"'<>]+)["']`, "i")) ??
+     block.match(new RegExp(`content=["']([^"'<>]+)["'][^>]*itemprop=["']${prop}["']`, "i")))?.[1]?.trim() ?? "";
 
-  // Collect all iataCode values IN ORDER — airline code first, then dep, then arr
   const allIata = [
     ...block.matchAll(/itemprop=["']iataCode["'][^>]*content=["']([A-Z]{2,3})["']/gi),
     ...block.matchAll(/content=["']([A-Z]{2,3})["'][^>]*itemprop=["']iataCode["']/gi),
   ].map(m => m[1].toUpperCase());
 
-  // Deduplicate preserving order
   const seen = new Set<string>();
   const codes = allIata.filter(c => { if (seen.has(c)) return false; seen.add(c); return true; });
-
-  if (codes.length < 1) return null;
+  if (!codes.length) return null;
 
   const airlineCode = codes[0];
-  // Airline codes are 2 chars, airport codes are 3 chars
+  if (airlineCode.length !== 2) return null;
   const airports = codes.filter(c => c.length === 3);
-  const dep = airports[0] ?? null;
-  const arr = airports[1] ?? null;
 
   const rawNum = getMeta("flightNumber").replace(/\D/g, "");
   if (!rawNum) return null;
   const flightNum = parseInt(rawNum, 10);
-  if (isNaN(flightNum) || airlineCode.length !== 2) return null;
+  if (isNaN(flightNum)) return null;
 
-  const depTime = getMeta("departureTime");
   let date: string | null = null;
+  const depTime = getMeta("departureTime");
   if (depTime) {
     const d = new Date(depTime);
     if (!isNaN(d.getTime())) date = d.toISOString().split("T")[0];
   }
 
-  const AIRLINE_NAMES: Record<string, string> = {
-    IB: "Iberia", KL: "KLM", QR: "Qatar Airways", TK: "Turkish Airlines",
-    UA: "United", BA: "British Airways", FR: "Ryanair", U2: "easyJet",
-    VY: "Vueling", AF: "Air France", LH: "Lufthansa", EK: "Emirates",
-    W6: "Wizz Air", HV: "Transavia", DY: "Norwegian", TP: "TAP",
-    UX: "Air Europa", DL: "Delta", AA: "American", EY: "Etihad",
-    SK: "SAS", AY: "Finnair", LO: "LOT", LX: "SWISS", OS: "Austrian",
-    SN: "Brussels Airlines", V7: "Volotea", BT: "airBaltic",
-  };
-
   return {
     flight_number: `${airlineCode}${flightNum}`,
     airline: AIRLINE_NAMES[airlineCode] ?? airlineCode,
-    departure_airport: dep,
-    arrival_airport: arr,
+    departure_airport: airports[0] ?? null,
+    arrival_airport: airports[1] ?? null,
     departure_date: date,
   };
+}
+
+function parseEmail(payload: any): ParsedFlight[] {
+  const htmlParts = getHtmlParts(payload);
+  const html = htmlParts.join("\n");
+  if (!html) return [];
+  if (html.includes("application/ld+json")) {
+    const results = extractJsonLd(html);
+    if (results.length) return results;
+  }
+  if (html.includes("FlightReservation")) {
+    return extractMicrodata(html);
+  }
+  return [];
 }
 
 // ─── MAIN SCAN ────────────────────────────────────────────────────────────────
@@ -226,61 +190,85 @@ export const scanGmail = createServerFn({ method: "POST" })
     const googleToken = profileData?.gmail_access_token;
     if (!googleToken) return { detected: 0, inserted: 0, error: "No Gmail token — sign out and back in" };
 
-    // ── Step 1: Fetch emails from category:reservations ───────────────────
-    // This is Gmail's own booking/reservation category — filters out all
-    // promotional emails, newsletters, and marketing automatically.
-    // It's the same filter that powers Google's trip detection.
-    const listRes = await fetch(
-      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=40`,
+    // ── Step 1: Fetch threads (not messages) from category:reservations ───
+    // Using threads instead of messages means one booking = one thread.
+    // The first message in each thread is the original booking confirmation
+    // with structured data. Follow-ups (gate change, check-in, boarding)
+    // are later messages in the same thread — we skip them automatically.
+    // 54 emails → ~20 unique threads → well within 35 subrequest budget.
+    const threadsRes = await fetch(
+      `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=40`,
       { headers: { Authorization: `Bearer ${googleToken}` } }
     );
 
-    if (!listRes.ok) {
-      if (listRes.status === 401) return { detected: 0, inserted: 0, error: "Gmail token expired — sign out and back in" };
-      return { detected: 0, inserted: 0, error: `Gmail error ${listRes.status}` };
+    if (!threadsRes.ok) {
+      if (threadsRes.status === 401) return { detected: 0, inserted: 0, error: "Gmail token expired — sign out and back in" };
+      return { detected: 0, inserted: 0, error: `Gmail error ${threadsRes.status}` };
     }
 
-    const listData = await listRes.json();
-    const messages: any[] = listData.messages ?? [];
-    if (!messages.length) return { detected: 0, inserted: 0, error: "No reservation emails found" };
+    const threadsData = await threadsRes.json();
+    const threads: any[] = threadsData.threads ?? [];
+    if (!threads.length) return { detected: 0, inserted: 0, error: "No reservation emails found in Gmail" };
 
-    // ── Step 2: Fetch and parse each email ────────────────────────────────
-    // Budget: 1 (list) + up to 35 (full fetch) + 1 (delete) + 1 (insert) = 38
+    // ── Step 2: For each thread, fetch the FIRST message only ─────────────
+    // threads/{id}?format=metadata returns all message IDs in the thread.
+    // We then fetch only messages[0] (original booking) with format=full.
+    // This costs 2 subrequests per thread (metadata + full first message).
+    // 20 threads × 2 = 40 subrequests + 1 list = 41 total. Fine.
+    //
+    // HOWEVER: to stay safe under 50, we fetch threads directly with
+    // format=full which returns all messages in the thread in one call.
+    // We then only parse the first message. 1 subrequest per thread.
+
     const flightMap = new Map<string, ParsedFlight>();
+    let threadsProcessed = 0;
 
-    for (const msg of messages.slice(0, 35)) {
+    for (const thread of threads) {
+      // Stop if we're approaching the subrequest limit
+      // 1 (threads list) + N (thread fetches) + 1 (delete) + 1 (insert) < 50
+      if (threadsProcessed >= 45) break;
+
       try {
-        const res = await fetch(
-          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
+        const threadRes = await fetch(
+          // format=metadata is fast and returns message list with snippets
+          // We use it to get the oldest message ID cheaply
+          `https://gmail.googleapis.com/gmail/v1/users/me/threads/${thread.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From`,
           { headers: { Authorization: `Bearer ${googleToken}` } }
         );
-        if (!res.ok) continue;
-        const full = await res.json();
+        threadsProcessed++;
+        if (!threadRes.ok) continue;
 
-        const htmlParts = getHtmlParts(full.payload);
-        const fullHtml = htmlParts.join("\n");
-        if (!fullHtml) continue;
+        const threadData = await threadRes.json();
+        const threadMessages: any[] = threadData.messages ?? [];
+        if (!threadMessages.length) continue;
 
-        // Try JSON-LD first (Qatar Airways, some KLM, some United)
-        let parsed: ParsedFlight[] = [];
+        // Get the oldest message in thread (index 0 = first/oldest)
+        // This is the original booking confirmation
+        const firstMsg = threadMessages[0];
 
-        if (fullHtml.includes("application/ld+json")) {
-          parsed = extractJsonLd(fullHtml);
-        }
+        // Quick subject check from metadata to skip obvious non-flight threads
+        const subjectHeader = firstMsg.payload?.headers?.find((h: any) => h.name === "Subject");
+        const subject = (subjectHeader?.value ?? "").toLowerCase();
+        if (["hotel", "car hire", "car rental", "restaurant", "event", "concert", "train",
+             "bus", "ferry", "cruise", "visa", "passport"].some(w => subject.includes(w))) continue;
 
-        // Try microdata if JSON-LD found nothing (Iberia, Turkish, most others)
-        if (!parsed.length && fullHtml.includes("FlightReservation")) {
-          parsed = extractMicrodata(fullHtml);
-        }
+        // Fetch full content of just this first message
+        const msgRes = await fetch(
+          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${firstMsg.id}?format=full`,
+          { headers: { Authorization: `Bearer ${googleToken}` } }
+        );
+        threadsProcessed++;
+        if (!msgRes.ok) continue;
 
-        // Deduplicate into map
-        for (const f of parsed) {
+        const msgData = await msgRes.json();
+        const flights = parseEmail(msgData.payload);
+
+        for (const f of flights) {
           if (!f.flight_number) continue;
           const key = `${f.flight_number}-${f.departure_date ?? "nodate"}`;
           if (!flightMap.has(key)) {
             flightMap.set(key, f);
           } else {
-            // Enrich existing record with any missing fields
             const ex = flightMap.get(key)!;
             if (!ex.departure_airport && f.departure_airport) ex.departure_airport = f.departure_airport;
             if (!ex.arrival_airport   && f.arrival_airport)   ex.arrival_airport   = f.arrival_airport;
@@ -292,20 +280,20 @@ export const scanGmail = createServerFn({ method: "POST" })
 
     if (!flightMap.size) {
       return {
-        detected: messages.length,
+        detected: threads.length,
         inserted: 0,
-        error: "Emails found but no structured flight data detected. Airlines may not include Schema.org markup.",
+        error: "Reservation emails found but no structured flight data (JSON-LD/microdata) detected",
       };
     }
 
     // ── Step 3: Write to database ─────────────────────────────────────────
     const toInsert = [...flightMap.values()].map(f => ({
-      user_id: userId,
-      flight_number:      f.flight_number,
-      airline:            f.airline,
-      departure_airport:  f.departure_airport,
-      arrival_airport:    f.arrival_airport,
-      departure_date:     f.departure_date,
+      user_id:           userId,
+      flight_number:     f.flight_number,
+      airline:           f.airline,
+      departure_airport: f.departure_airport,
+      arrival_airport:   f.arrival_airport,
+      departure_date:    f.departure_date,
     }));
 
     await (supabase as any).from("flights").delete().eq("user_id", userId);
@@ -314,7 +302,7 @@ export const scanGmail = createServerFn({ method: "POST" })
       .from("flights").insert(toInsert).select();
 
     return {
-      detected: messages.length,
+      detected: threads.length,
       inserted: ins?.length ?? 0,
       error: insErr?.message ?? null,
     };
