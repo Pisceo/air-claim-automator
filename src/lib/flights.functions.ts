@@ -277,13 +277,19 @@ export const scanGmail = createServerFn({ method: "POST" })
     // Parse flights from first messages
     const flightMap = new Map<string, ParsedFlight>();
     const threadsNeedingFallback: string[] = [];
+    const parseDebug: string[] = [];
 
     for (const { threadId, messageIds } of threadMessageIds) {
       const msgData = firstBatch.get(messageIds[0]);
-      if (!msgData?.payload) continue;
+      if (!msgData?.payload) { parseDebug.push(`${messageIds[0]}: NO PAYLOAD`); continue; }
+      const html = getHtml(msgData.payload);
+      const hasJsonLd = html.includes("application/ld+json");
+      const hasMicrodata = html.includes("FlightReservation");
+      const hasWidget = html.includes("itemprop");
       const flights = parseFlightsFromPayload(msgData.payload);
+      const subj = metaBatch.get(threadId)?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "Subject")?.value ?? "?";
+      parseDebug.push(`${subj.slice(0,40)} | jsonld:${hasJsonLd} micro:${hasMicrodata} itemprop:${hasWidget} flights:${flights.length}`);
       if (flights.length === 0 && messageIds.length > 1) {
-        // First message had no structured data — try message 2 or 3
         threadsNeedingFallback.push(...messageIds.slice(1));
         continue;
       }
@@ -349,6 +355,7 @@ export const scanGmail = createServerFn({ method: "POST" })
       inserted: toInsert.length,
       error: rpcErr?.message ?? null,
       debug: {
+        parseDebug,
         threadSubjects: [...metaBatch.entries()].slice(0, 40).map(([id, td]) => {
           const subj = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "Subject")?.value ?? "NO SUBJECT";
           const from = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "From")?.value ?? "NO FROM";
