@@ -45,29 +45,6 @@ const ALL_AIRPORTS = new Set([
   "YYZ","YVR","MEX","GRU","EZE","SCL","LIM","BOG","NBO","JNB","CPT","SYD","MEL","AKL",
 ]);
 
-const CITY_IATA: Record<string, string> = {
-  "madrid": "MAD", "amsterdam": "AMS", "barcelona": "BCN",
-  "london": "LHR", "london heathrow": "LHR", "london gatwick": "LGW",
-  "london stansted": "STN", "london luton": "LTN",
-  "paris": "CDG", "paris charles de gaulle": "CDG", "paris orly": "ORY",
-  "frankfurt": "FRA", "munich": "MUC", "berlin": "BER",
-  "rome": "FCO", "milan": "MXP", "venice": "VCE", "naples": "NAP",
-  "lisbon": "LIS", "porto": "OPO", "faro": "FAO",
-  "istanbul": "IST", "istanbul ataturk": "IST", "istanbul sabiha": "SAW",
-  "dubai": "DXB", "abu dhabi": "AUH", "doha": "DOH",
-  "athens": "ATH", "vienna": "VIE", "zurich": "ZRH",
-  "brussels": "BRU", "copenhagen": "CPH", "stockholm": "ARN",
-  "oslo": "OSL", "helsinki": "HEL", "warsaw": "WAW",
-  "dublin": "DUB", "new york": "JFK", "new york jfk": "JFK",
-  "newark": "EWR", "new york newark": "EWR", "los angeles": "LAX",
-  "chicago": "ORD", "miami": "MIA", "boston": "BOS",
-  "san francisco": "SFO", "washington": "IAD", "houston": "IAH",
-  "dallas": "DFW", "toronto": "YYZ", "mexico city": "MEX",
-  "hong kong": "HKG", "singapore": "SIN", "bangkok": "BKK",
-  "tokyo": "NRT", "seoul": "ICN", "kuala lumpur": "KUL",
-  "delhi": "DEL", "mumbai": "BOM", "sydney": "SYD", "melbourne": "MEL",
-};
-
 // ─── DECODE ──────────────────────────────────────────────────────────────────
 
 function base64Decode(str: string): string {
@@ -102,9 +79,6 @@ function getHtmlParts(payload: any, depth = 0): string[] {
 function getPlainText(payload: any, depth = 0): string {
   if (depth > 4) return "";
   let text = "";
-  if (payload?.body?.data) {
-    try { text += base64Decode(payload.body.data); } catch { /* skip */ }
-  }
   if (payload?.parts) {
     for (const p of payload.parts) {
       if (p.mimeType === "text/plain" && p.body?.data) {
@@ -117,8 +91,9 @@ function getPlainText(payload: any, depth = 0): string {
   return text;
 }
 
-// ─── STRATEGY 1: HTML MICRODATA (itemprop) ────────────────────────────────────
-// Used by: Iberia, United, Turkish Airlines, British Airways
+// ─── STRUCTURED DATA: MICRODATA ──────────────────────────────────────────────
+// Extracts schema.org/FlightReservation microdata blocks precisely
+// Used by Iberia, United, Turkish Airlines, British Airways, Qatar
 
 interface ParsedFlight {
   flightNumber: string;
@@ -128,60 +103,86 @@ interface ParsedFlight {
   date: string | null;
 }
 
-function extractFromMicrodata(html: string): ParsedFlight[] {
-  const flights: ParsedFlight[] = [];
+function extractMicrodata(html: string): ParsedFlight[] {
+  const results: ParsedFlight[] = [];
 
-  // Find all FlightReservation blocks
-  const reservationBlocks = html.matchAll(
-    /itemtype=["'][^"']*FlightReservation["'][^>]*>([\s\S]*?)(?=itemtype=["'][^"']*FlightReservation["']|$)/gi
-  );
+  // Find the opening tag of each FlightReservation
+  const openTagRe = /<[^>]+itemtype=["'][^"']*schema\.org\/FlightReservation["'][^>]*>/gi;
+  const openMatches = [...html.matchAll(openTagRe)];
 
-  for (const block of reservationBlocks) {
-    const content = block[1];
-    const flight = parseItempropBlock(content);
-    if (flight) flights.push(flight);
+  for (const open of openMatches) {
+    const start = (open.index ?? 0) + open[0].length;
+
+    // Find matching closing </div> by counting nesting
+    let depth = 1;
+    let pos = start;
+    while (pos < html.length && depth > 0) {
+      const nextOpen  = html.indexOf("<div", pos);
+      const nextClose = html.indexOf("</div", pos);
+      if (nextClose === -1) break;
+      if (nextOpen !== -1 && nextOpen < nextClose) {
+        depth++;
+        pos = nextOpen + 4;
+      } else {
+        depth--;
+        pos = nextClose + 5;
+      }
+    }
+
+    // The block is html[start..pos]
+    const block = html.slice(start, pos);
+    const flight = parseMicrodataBlock(block);
+    if (flight) results.push(flight);
   }
 
-  // Fallback: try whole HTML if no blocks found
-  if (flights.length === 0) {
-    const flight = parseItempropBlock(html);
-    if (flight) flights.push(flight);
-  }
-
-  return flights;
+  return results;
 }
 
-function parseItempropBlock(html: string): ParsedFlight | null {
-  // Extract itemprop meta values
-  function getMeta(prop: string): string {
-    const m = html.match(new RegExp(`itemprop=["']${prop}["'][^>]*content=["']([^"']+)["']`, "i"))
-      || html.match(new RegExp(`content=["']([^"']+)["'][^>]*itemprop=["']${prop}["']`, "i"));
-    return m ? m[1].trim() : "";
+function parseMicrodataBlock(block: string): ParsedFlight | null {
+  // Extract all meta itemprop values — only look within this block
+  function getMetaContent(prop: string): string {
+    // Match both attribute orderings
+    const re1 = new RegExp(`itemprop=["']${prop}["'][^>]*content=["']([^"'<>]+)["']`, "i");
+    const re2 = new RegExp(`content=["']([^"'<>]+)["'][^>]*itemprop=["']${prop}["']`, "i");
+    return (block.match(re1) || block.match(re2))?.[1]?.trim() ?? "";
   }
 
-  // Get all iataCode values in order: airline, departureAirport, arrivalAirport
-  const iataCodes = [...html.matchAll(/itemprop=["']iataCode["'][^>]*content=["']([^"']+)["']/gi)]
-    .map(m => m[1].trim().toUpperCase());
+  // Get all iataCode values strictly within this block
+  // Order: airline iataCode, then departure airport iataCode, then arrival airport iataCode
+  const iataMatches = [
+    ...block.matchAll(/itemprop=["']iataCode["'][^>]*content=["']([^"'<>]+)["']/gi),
+    ...block.matchAll(/content=["']([^"'<>]+)["'][^>]*itemprop=["']iataCode["']/gi),
+  ].map(m => m[1].trim().toUpperCase());
 
-  if (iataCodes.length === 0) return null;
+  // Deduplicate while preserving order
+  const seen = new Set<string>();
+  const iataCodes = iataMatches.filter(c => { if (seen.has(c)) return false; seen.add(c); return true; });
 
-  // First iataCode is airline, second is departure airport, third is arrival airport
+  if (iataCodes.length < 1) return null;
+
   const airlineCode = iataCodes[0];
+  if (!AIRLINE_MAP[airlineCode]) return null;
+
   const dep = iataCodes[1] && ALL_AIRPORTS.has(iataCodes[1]) ? iataCodes[1] : null;
   const arr = iataCodes[2] && ALL_AIRPORTS.has(iataCodes[2]) ? iataCodes[2] : null;
 
-  if (!AIRLINE_MAP[airlineCode]) return null;
-
-  const rawFlightNum = getMeta("flightNumber");
+  const rawFlightNum = getMetaContent("flightNumber");
   if (!rawFlightNum) return null;
 
-  const flightNumber = `${airlineCode}${rawFlightNum.padStart(4, "0")}`;
+  // Format flight number correctly: IB + 0740 = IB0740
+  const numPart = rawFlightNum.replace(/\D/g, "");
+  const flightNumber = `${airlineCode}${numPart}`;
 
-  const depTime = getMeta("departureTime");
+  // Get departure date from departureTime ISO string
+  const depTime = getMetaContent("departureTime");
   let date: string | null = null;
   if (depTime) {
+    // Parse ISO datetime — format as DD/MM/YYYY for display
     const d = new Date(depTime);
-    if (!isNaN(d.getTime())) date = d.toISOString().split("T")[0];
+    if (!isNaN(d.getTime())) {
+      // Store as YYYY-MM-DD internally, display logic handles format
+      date = d.toISOString().split("T")[0];
+    }
   }
 
   return {
@@ -193,144 +194,111 @@ function parseItempropBlock(html: string): ParsedFlight | null {
   };
 }
 
-// ─── STRATEGY 2: JSON-LD ─────────────────────────────────────────────────────
-// Some airlines do use JSON-LD, keep as backup
+// ─── STRUCTURED DATA: JSON-LD ────────────────────────────────────────────────
 
-function extractFromJsonLd(html: string): ParsedFlight[] {
-  const flights: ParsedFlight[] = [];
+function extractJsonLd(html: string): ParsedFlight[] {
+  const results: ParsedFlight[] = [];
   for (const match of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
     try {
       const json = JSON.parse(match[1].trim());
       const items = Array.isArray(json) ? json : [json];
       for (const item of items) {
-        const nodes = item["@graph"] ? item["@graph"] : [item];
-        for (const node of nodes) {
-          const f = parseJsonLdNode(node);
-          if (f) flights.push(f);
+        for (const node of (item["@graph"] ?? [item])) {
+          const f = parseJsonLdNode(Array.isArray(node) ? node[0] : node);
+          if (f) results.push(f);
         }
       }
     } catch { /* skip */ }
   }
-  return flights;
+  return results;
 }
 
 function parseJsonLdNode(node: any): ParsedFlight | null {
   if (!node || typeof node !== "object") return null;
-  const reservationFor = node.reservationFor ?? node;
-  const flight = node["@type"] === "Flight" ? node : reservationFor;
+  const rf = node.reservationFor ?? node;
+  const flight = node["@type"] === "Flight" ? node : rf;
   if (!flight) return null;
-
-  const rawNum = flight.flightNumber ?? "";
-  const airlineObj = flight.airline ?? flight.operatingAirline ?? {};
-  const iataCode = (airlineObj.iataCode ?? "").toUpperCase();
+  const rawNum = String(flight.flightNumber ?? "");
+  const iataCode = (flight.airline?.iataCode ?? "").toUpperCase();
   if (!rawNum || !iataCode || !AIRLINE_MAP[iataCode]) return null;
-
-  const flightNumber = `${iataCode}${String(rawNum).padStart(4, "0")}`;
-  const dep = (flight.departureAirport?.iataCode ?? "").toUpperCase() || null;
-  const arr = (flight.arrivalAirport?.iataCode ?? "").toUpperCase() || null;
-
+  const flightNumber = `${iataCode}${rawNum.replace(/\D/g, "")}`;
+  const dep = (flight.departureAirport?.iataCode ?? "").toUpperCase();
+  const arr = (flight.arrivalAirport?.iataCode ?? "").toUpperCase();
   let date: string | null = null;
-  const depTime = flight.departureTime ?? "";
-  if (depTime) {
-    const d = new Date(depTime);
+  if (flight.departureTime) {
+    const d = new Date(flight.departureTime);
     if (!isNaN(d.getTime())) date = d.toISOString().split("T")[0];
   }
-
   return {
     flightNumber,
     airline: AIRLINE_MAP[iataCode],
-    dep: dep && ALL_AIRPORTS.has(dep) ? dep : null,
-    arr: arr && ALL_AIRPORTS.has(arr) ? arr : null,
+    dep: ALL_AIRPORTS.has(dep) ? dep : null,
+    arr: ALL_AIRPORTS.has(arr) ? arr : null,
     date,
   };
 }
 
-// ─── STRATEGY 3: REGEX FALLBACK ──────────────────────────────────────────────
-// For KLM check-in emails which have no structured data at all
+// ─── REGEX FALLBACK ──────────────────────────────────────────────────────────
+// For KLM check-in emails which embed data only in HTML table cells
 
-function extractFromRegex(text: string, from: string): ParsedFlight | null {
-  // Extract flight number
-  const fnMatch = text.match(/\b([A-Z]{2})(\d{3,4})\b/);
+function extractRegex(allText: string, from: string): ParsedFlight | null {
+  const fnMatch = allText.match(/\b([A-Z]{2})(\d{3,4})\b/);
   if (!fnMatch || !AIRLINE_MAP[fnMatch[1]]) return null;
   const flightNumber = fnMatch[1] + fnMatch[2];
-  const airlineCode = fnMatch[1];
+  const airlineCode  = fnMatch[1];
 
-  // Extract route — look for "City (IATA)" pattern first (KLM uses this)
-  const cityIataPattern = /([A-Z][a-zA-Z\s]+)\s*\(([A-Z]{3})\)/g;
-  const routeCodes: string[] = [];
-  for (const m of text.matchAll(cityIataPattern)) {
-    const code = m[2].toUpperCase();
-    if (ALL_AIRPORTS.has(code)) routeCodes.push(code);
+  // "Madrid (MAD)" pattern — most reliable for KLM
+  const cityIata: string[] = [];
+  for (const m of allText.matchAll(/[A-Z][a-zA-Z\s]+\(([A-Z]{3})\)/g)) {
+    if (ALL_AIRPORTS.has(m[1])) cityIata.push(m[1]);
   }
 
-  let dep: string | null = routeCodes[0] ?? null;
-  let arr: string | null = routeCodes[1] ?? null;
-
-  // If no city(IATA) pattern, try bare IATA codes
-  if (!dep || !arr) {
-    const codes = [...text.matchAll(/\b([A-Z]{3})\b/g)]
-      .map(m => m[1])
-      .filter(c => ALL_AIRPORTS.has(c));
-    const unique = [...new Set(codes)];
-    dep = dep ?? unique[0] ?? null;
-    arr = arr ?? unique[1] ?? null;
-  }
-
-  // Extract date
-  const date = extractDate(text);
-
-  const airline = guessAirlineFromSender(from) || AIRLINE_MAP[airlineCode] || airlineCode;
-
+  const dep = cityIata[0] ?? null;
+  const arr = cityIata[1] ?? null;
+  const date = extractDate(allText);
   if (!date) return null;
 
+  const airline = guessAirline(from) || AIRLINE_MAP[airlineCode] || airlineCode;
   return { flightNumber, airline, dep, arr, date };
 }
 
 function extractDate(text: string): string | null {
-  const MONTHS: Record<string, string> = {
+  const M: Record<string, string> = {
     jan:"01",feb:"02",mar:"03",apr:"04",may:"05",jun:"06",
     jul:"07",aug:"08",sep:"09",oct:"10",nov:"11",dec:"12",
-    january:"01",february:"02",march:"03",april:"04",june:"06",
-    july:"07",august:"08",september:"09",october:"10",november:"11",december:"12",
   };
-  const candidates: string[] = [];
-  const p1 = /\b(\d{1,2})\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(20\d{2})\b/gi;
-  const p2 = /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})[,\s]+(20\d{2})\b/gi;
-  const p3 = /\b(20\d{2})-(\d{2})-(\d{2})\b/g;
-  const p4 = /\b(\d{2})\/(\d{2})\/(20\d{2})\b/g;
-  // KLM specific: "Thu 28 May 26" (short year)
-  const p5 = /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2})\b/gi;
+  const all: string[] = [];
 
-  let m;
-  while ((m = p1.exec(text))) {
-    const y = m[3], mo = MONTHS[m[2].toLowerCase().slice(0,3)] || "01", d = m[1].padStart(2,"0");
-    if (parseInt(y) >= 2020 && parseInt(y) <= 2027) candidates.push(`${y}-${mo}-${d}`);
-  }
-  while ((m = p2.exec(text))) {
-    const y = m[3], mo = MONTHS[m[1].toLowerCase().slice(0,3)] || "01", d = m[2].padStart(2,"0");
-    if (parseInt(y) >= 2020 && parseInt(y) <= 2027) candidates.push(`${y}-${mo}-${d}`);
-  }
-  while ((m = p3.exec(text))) {
-    if (parseInt(m[1]) >= 2020 && parseInt(m[1]) <= 2027) candidates.push(`${m[1]}-${m[2]}-${m[3]}`);
-  }
-  while ((m = p4.exec(text))) {
-    if (parseInt(m[3]) >= 2020 && parseInt(m[3]) <= 2027) candidates.push(`${m[3]}-${m[2]}-${m[1]}`);
-  }
-  while ((m = p5.exec(text))) {
-    // "Thu 28 May 26" → 2026-05-28
-    const day = m[1].padStart(2,"0");
-    const mo = MONTHS[m[2].toLowerCase()] || "01";
-    const yr = parseInt(m[3]) >= 50 ? `19${m[3]}` : `20${m[3]}`;
-    if (parseInt(yr) >= 2020 && parseInt(yr) <= 2027) candidates.push(`${yr}-${mo}-${day}`);
+  // ISO: 2026-04-07
+  for (const m of text.matchAll(/\b(202[0-7])-(\d{2})-(\d{2})\b/g))
+    all.push(`${m[1]}-${m[2]}-${m[3]}`);
+
+  // "7 April 2026" or "07 Apr 2026"
+  for (const m of text.matchAll(/\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(202[0-7])\b/gi))
+    all.push(`${m[3]}-${M[m[2].toLowerCase().slice(0,3)]}-${m[1].padStart(2,"0")}`);
+
+  // "April 7, 2026"
+  for (const m of text.matchAll(/\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\s+(\d{1,2})[,\s]+(202[0-7])\b/gi))
+    all.push(`${m[3]}-${M[m[1].toLowerCase().slice(0,3)]}-${m[2].padStart(2,"0")}`);
+
+  // KLM: "Thu 28 May 26"
+  for (const m of text.matchAll(/\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2})\b/gi)) {
+    const yr = `20${m[3]}`;
+    if (parseInt(yr) >= 2020 && parseInt(yr) <= 2027)
+      all.push(`${yr}-${M[m[2].toLowerCase().slice(0,3)]}-${m[1].padStart(2,"0")}`);
   }
 
-  const valid = candidates.filter(d => !isNaN(new Date(d).getTime()));
-  if (valid.length === 0) return null;
+  // DD/MM/YYYY
+  for (const m of text.matchAll(/\b(\d{2})\/(\d{2})\/(202[0-7])\b/g))
+    all.push(`${m[3]}-${m[2]}-${m[1]}`);
+
+  const valid = all.filter(d => !isNaN(new Date(d).getTime()));
+  if (!valid.length) return null;
   valid.sort();
   return valid[0];
 }
 
-function guessAirlineFromSender(from: string): string | null {
+function guessAirline(from: string): string | null {
   const f = from.toLowerCase();
   if (f.includes("klm")) return "KLM";
   if (f.includes("ryanair")) return "Ryanair";
@@ -343,7 +311,7 @@ function guessAirlineFromSender(from: string): string | null {
   if (f.includes("britishairways")) return "British Airways";
   if (f.includes("transavia")) return "Transavia";
   if (f.includes("norwegian")) return "Norwegian";
-  if (f.includes("tap.pt")) return "TAP";
+  if (f.includes("tap")) return "TAP";
   if (f.includes("turkishairlines") || f.includes("thy.com")) return "Turkish Airlines";
   if (f.includes("emirates")) return "Emirates";
   if (f.includes("united.com")) return "United";
@@ -365,12 +333,9 @@ export const scanGmail = createServerFn({ method: "POST" })
     const googleToken = profileData?.gmail_access_token;
     if (!googleToken) return { detected: 0, inserted: 0, error: "No Gmail token — sign out and back in" };
 
-    // 1 subrequest: list emails
     const domainQuery = AIRLINE_DOMAINS.map(d => `from:${d}`).join(" OR ");
-    const q = `(${domainQuery}) newer_than:1095d`;
-
     const listRes = await fetch(
-      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(q)}&maxResults=35`,
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${encodeURIComponent(`(${domainQuery}) newer_than:1095d`)}&maxResults=35`,
       { headers: { Authorization: `Bearer ${googleToken}` } }
     );
 
@@ -380,12 +345,11 @@ export const scanGmail = createServerFn({ method: "POST" })
     }
 
     const messages: any[] = (await listRes.json()).messages ?? [];
-    if (messages.length === 0) return { detected: 0, inserted: 0, error: "No matching emails found" };
+    if (!messages.length) return { detected: 0, inserted: 0, error: "No matching emails found" };
 
-    // Clear old flights
     await (supabase as any).from("flights").delete().eq("user_id", userId);
 
-    // flightMap key = "FLIGHTNUM-DATE" — no duplicates
+    // Key: "FLIGHTNUM-DATE" → one record per unique flight
     const flightMap = new Map<string, any>();
 
     for (const msg of messages) {
@@ -397,52 +361,52 @@ export const scanGmail = createServerFn({ method: "POST" })
         if (!res.ok) continue;
         const full = await res.json();
 
-        const hdrs = full.payload?.headers ?? [];
+        const hdrs    = full.payload?.headers ?? [];
         const subject = hdrs.find((h: any) => h.name === "Subject")?.value ?? "";
         const from    = hdrs.find((h: any) => h.name === "From")?.value ?? "";
         const dateHdr = hdrs.find((h: any) => h.name === "Date")?.value ?? "";
 
-        // Skip noise emails
         const subj = subject.toLowerCase();
-        if (["survey","newsletter","unsubscribe","miles earned","points earned",
-             "feedback","satisfaction"].some(w => subj.includes(w))) continue;
+        if (["survey","newsletter","unsubscribe","miles earned","points earned","feedback","satisfaction"]
+            .some(w => subj.includes(w))) continue;
 
         const htmlParts = getHtmlParts(full.payload);
         const fullHtml  = htmlParts.join("\n");
         const plainText = getPlainText(full.payload);
-        const allText   = subject + "\n" + plainText + "\n" + fullHtml.replace(/<[^>]+>/g, " ");
+        const allText   = subject + "\n" + plainText + "\n" +
+                          fullHtml.replace(/<style[\s\S]*?<\/style>/gi, "")
+                                  .replace(/<script[\s\S]*?<\/script>/gi, "")
+                                  .replace(/<[^>]+>/g, " ")
+                                  .replace(/\s+/g, " ");
 
-        let parsedFlights: ParsedFlight[] = [];
+        let parsed: ParsedFlight[] = [];
 
-        // Strategy 1: microdata (Iberia, United, Turkish)
-        if (fullHtml.includes("itemprop") && fullHtml.includes("FlightReservation")) {
-          parsedFlights = extractFromMicrodata(fullHtml);
+        // Strategy 1: microdata (Iberia, United, Turkish, Qatar, BA)
+        if (fullHtml.includes("FlightReservation")) {
+          parsed = extractMicrodata(fullHtml);
         }
 
         // Strategy 2: JSON-LD
-        if (parsedFlights.length === 0 && fullHtml.includes("application/ld+json")) {
-          for (const html of htmlParts) {
-            parsedFlights.push(...extractFromJsonLd(html));
-          }
+        if (!parsed.length && fullHtml.includes("ld+json")) {
+          parsed = extractJsonLd(fullHtml);
         }
 
-        // Strategy 3: regex fallback (KLM check-in emails, others)
-        if (parsedFlights.length === 0) {
-          const f = extractFromRegex(allText, from);
-          if (f) parsedFlights.push(f);
+        // Strategy 3: regex (KLM check-in, others)
+        if (!parsed.length) {
+          const f = extractRegex(allText, from);
+          if (f) parsed.push(f);
         }
 
-        // Fix missing dates using email header date as fallback
-        for (const pf of parsedFlights) {
+        // Fill missing dates from email header
+        for (const pf of parsed) {
           if (!pf.date) {
-            const ed = new Date(dateHdr);
-            if (!isNaN(ed.getTime())) pf.date = ed.toISOString().split("T")[0];
+            const d = new Date(dateHdr);
+            if (!isNaN(d.getTime())) pf.date = d.toISOString().split("T")[0];
           }
         }
 
-        // Add to map — dedup by FLIGHTNUM-DATE
-        for (const pf of parsedFlights) {
-          if (!pf.date || !pf.flightNumber) continue;
+        for (const pf of parsed) {
+          if (!pf.flightNumber || !pf.date) continue;
           const key = `${pf.flightNumber}-${pf.date}`;
           if (!flightMap.has(key)) {
             flightMap.set(key, {
@@ -455,27 +419,26 @@ export const scanGmail = createServerFn({ method: "POST" })
               raw_email_snippet: (full.snippet ?? "").slice(0, 200),
             });
           } else {
-            const ex = flightMap.get(key);
+            const ex = flightMap.get(key)!;
             if (!ex.departure_airport && pf.dep) ex.departure_airport = pf.dep;
-            if (!ex.arrival_airport && pf.arr) ex.arrival_airport = pf.arr;
+            if (!ex.arrival_airport   && pf.arr) ex.arrival_airport   = pf.arr;
           }
         }
       } catch { continue; }
     }
 
-    const toInsert = [...flightMap.values()].filter(f => {
-      if (!f.flight_number || !f.departure_date) return false;
-      const d = new Date(f.departure_date);
-      return !isNaN(d.getTime()) && d.getFullYear() >= 2020 && d.getFullYear() <= 2027;
-    });
+    const toInsert = [...flightMap.values()].filter(f =>
+      f.flight_number && f.departure_date &&
+      !isNaN(new Date(f.departure_date).getTime())
+    );
 
     let actuallyInserted = 0;
     let insertError = null;
-    if (toInsert.length > 0) {
+    if (toInsert.length) {
       const { data: ins, error: insErr } = await (supabase as any)
         .from("flights").insert(toInsert).select();
-      if (insErr) { insertError = insErr.message; }
-      else { actuallyInserted = ins?.length ?? 0; }
+      if (insErr) insertError = insErr.message;
+      else actuallyInserted = ins?.length ?? 0;
     }
 
     return { detected: messages.length, parsed: toInsert.length, inserted: actuallyInserted, error: insertError };
