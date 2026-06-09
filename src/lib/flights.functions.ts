@@ -41,6 +41,7 @@ function normalizeFlightNumber(fn: string): string {
   return clean;
 }
 
+// Upgraded Date Hunter with English/Spanish month mapping
 function extractDateFromText(text: string, defaultYear: string): string | null {
   let m = text.match(/\b(202[3-9])[-/](1[0-2]|0?[1-9])[-/](3[01]|[12]\d|0?[1-9])\b/);
   if (m) return `${m[1]}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`;
@@ -48,14 +49,30 @@ function extractDateFromText(text: string, defaultYear: string): string | null {
   m = text.match(/\b(3[01]|[12]\d|0?[1-9])[-/](1[0-2]|0?[1-9])[-/](202[3-9])\b/);
   if (m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
 
-  const months = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
-  const monthRegex = months.join("|");
+  const monthMap: Record<string, string> = {
+    "JAN":"01", "ENE":"01", "FEB":"02", "MAR":"03", "APR":"04", "ABR":"04",
+    "MAY":"05", "JUN":"06", "JUL":"07", "AUG":"08", "AGO":"08", "SEP":"09",
+    "OCT":"10", "NOV":"11", "DEC":"12", "DIC":"12"
+  };
+  
+  const monthRegex = Object.keys(monthMap).join("|");
   const ddmmyyyy = new RegExp(`\\b(3[01]|[12]\\d|0?[1-9])\\s+(${monthRegex})[A-Z]*\\s*(202[3-9])?\\b`, 'i');
+  
   m = text.match(ddmmyyyy);
   if (m) {
     const day = m[1].padStart(2, '0');
-    const monthIdx = months.indexOf(m[2].toUpperCase()) + 1;
-    const month = monthIdx.toString().padStart(2, '0');
+    const monthKey = m[2].toUpperCase().substring(0, 3);
+    const month = monthMap[monthKey] || "01";
+    const year = m[3] || defaultYear;
+    return `${year}-${month}-${day}`;
+  }
+
+  const mmddyyyy = new RegExp(`\\b(${monthRegex})[A-Z]*\\s+(3[01]|[12]\\d|0?[1-9])(?:ST|ND|RD|TH)?\\s*,?\\s*(202[3-9])?\\b`, 'i');
+  m = text.match(mmddyyyy);
+  if (m) {
+    const monthKey = m[1].toUpperCase().substring(0, 3);
+    const month = monthMap[monthKey] || "01";
+    const day = m[2].padStart(2, '0');
     const year = m[3] || defaultYear;
     return `${year}-${month}-${day}`;
   }
@@ -127,7 +144,6 @@ const VALID_IATA_CODES = new Set([
   "JNB", "CPT", "CAI", "CMN", "ADD", "NBO"
 ]);
 
-// Used to map full city names to IATA codes from subject lines
 const CITY_TO_IATA: Record<string, string> = {
   "MADRID": "MAD", "AMSTERDAM": "AMS", "STANSTED": "STN", "LONDON": "STN",
   "HONG KONG": "HKG", "HONGKONG": "HKG", "ISTANBUL": "IST", "BRUSSELS": "BRU", 
@@ -247,7 +263,6 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
   if (html.includes("application/ld+json")) flights = flights.concat(extractJsonLd(html));
   if (html.includes("FlightReservation")) flights = flights.concat(extractMicrodata(html));
 
-  // Strip HTML and keep original casing to protect global acronyms
   let rawTextOriginal = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
                             .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
                             .replace(/<[^>]+>/g, ' ');
@@ -256,8 +271,6 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
   const combinedText = `${subjectUpper} ${rawTextOriginal}`;
   const defaultYear = fallbackDate ? fallbackDate.substring(0, 4) : new Date().getFullYear().toString();
 
-  // FIX 1: ORDER-PRESERVING SUBJECT SCANNER
-  // Records the exact string index where the city appears so we never reverse routes
   const foundSubjectCities: { code: string; index: number }[] = [];
   for (const [city, code] of Object.entries(CITY_TO_IATA)) {
     const idx = subjectUpper.indexOf(city);
@@ -265,14 +278,16 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
       foundSubjectCities.push({ code, index: idx });
     }
   }
-  // Sort strictly by left-to-right appearance in the sentence
   foundSubjectCities.sort((a, b) => a.index - b.index);
   const subjectAirports = foundSubjectCities.map(c => c.code);
 
   if (flights.length > 0) {
     for (const f of flights) {
-      if (!f.departure_airport && subjectAirports[0]) f.departure_airport = subjectAirports[0];
-      if (!f.arrival_airport && subjectAirports[1]) f.arrival_airport = subjectAirports[1];
+      // ONLY use the subject line if it explicitly dictates BOTH origin and destination
+      if (!f.departure_airport && subjectAirports.length === 2) {
+        f.departure_airport = subjectAirports[0];
+        f.arrival_airport = subjectAirports[1];
+      }
       
       if (!f.departure_airport || !f.arrival_airport) {
         const globalAirports = [...combinedText.matchAll(/\b([A-Z]{3})\b/g)]
@@ -282,12 +297,13 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
           if (!f.arrival_airport && globalAirports.length > 1) f.arrival_airport = globalAirports.find(a => a !== f.departure_airport) || null;
         }
       }
-      if (!f.departure_date) f.departure_date = extractDateFromText(combinedText.toUpperCase(), defaultYear) || fallbackDate;
+      if (!f.departure_date) {
+        f.departure_date = extractDateFromText(combinedText.toUpperCase(), defaultYear) || fallbackDate;
+      }
     }
     return flights;
   }
 
-  // FIX 2 & 3: STRICT ROUTE EXTRACTION FOR PURE TEXT (KLM, UNITED, TURKISH)
   const validCodes = Object.keys(AIRLINE_NAMES).join('|');
   const flightRegex = new RegExp(`\\b(${validCodes})\\s*(\\d{2,4})\\b`, 'gi');
   const flightMatches = [...combinedText.matchAll(flightRegex)];
@@ -295,32 +311,35 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
   if (flightMatches.length > 0) {
     const uniqueFlights = new Map<string, ParsedFlight>();
     
+    const allBodyAirports = [...rawTextOriginal.matchAll(/\b([A-Z]{3})\b/g)]
+      .map(m => m[1].toUpperCase())
+      .filter(code => VALID_IATA_CODES.has(code) && code !== "SEA");
+
     for (const m of flightMatches) {
-      // 200-character chunk to tie airports specifically to the nearest flight number
-      const chunk = combinedText.substring(Math.max(0, m.index! - 200), Math.min(combinedText.length, m.index! + 200));
-      
-      // Look explicitly for syntactical pairs (e.g. "MAD-AMS", "HKG to IST", "IAH / SAL")
-      const strictRoutes = [...chunk.matchAll(/\b([A-Z]{3})\s*[-/→: ]+(?:TO\s+)?([A-Z]{3})\b/gi)]
-        .map(match => ({ dep: match[1].toUpperCase(), arr: match[2].toUpperCase() }))
-        .filter(route => VALID_IATA_CODES.has(route.dep) && VALID_IATA_CODES.has(route.arr));
+      const iata = m[1].toUpperCase();
+      const num = m[2];
+      const flightNumber = `${iata}${num}`;
 
       let dep = null;
       let arr = null;
 
-      // Prioritize strict visual pairings (IAH-SAL), then subject line, then proximity guessing
-      if (strictRoutes.length > 0) {
-        dep = strictRoutes[0].dep;
-        arr = strictRoutes[0].arr;
-      } else if (subjectAirports.length >= 2) {
+      // FIX: ONLY use the subject line if it's a complete route (stops single-city hijack)
+      if (subjectAirports.length === 2) {
         dep = subjectAirports[0];
         arr = subjectAirports[1];
-      } else {
-        const looseAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
-          .map(a => a[1].toUpperCase()).filter(code => VALID_IATA_CODES.has(code));
-        if (looseAirports.length >= 2) {
-          dep = looseAirports[0];
-          arr = looseAirports.find(a => a !== dep) || null;
-        }
+      }
+
+      const chunk = combinedText.substring(Math.max(0, m.index! - 150), Math.min(combinedText.length, m.index! + 150));
+      let localAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
+        .map(a => a[1].toUpperCase())
+        .filter(code => VALID_IATA_CODES.has(code) && code !== "SEA");
+
+      if (!dep && localAirports[0]) dep = localAirports[0];
+      if (!arr && localAirports.length > 1) arr = localAirports.find(a => a !== dep) || null;
+
+      if ((!dep || !arr) && flightMatches.length === 1) {
+        if (!dep && allBodyAirports[0]) dep = allBodyAirports[0];
+        if (!arr && allBodyAirports.length > 1) arr = allBodyAirports.find(a => a !== dep) || null;
       }
 
       let flightDate = extractDateFromText(chunk.toUpperCase(), defaultYear);
@@ -328,10 +347,6 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
       if (!flightDate) flightDate = fallbackDate;
 
       if (dep && arr && flightDate) {
-        const iata = m[1].toUpperCase();
-        const num = m[2];
-        const flightNumber = `${iata}${num}`;
-
         if (!uniqueFlights.has(flightNumber)) {
            uniqueFlights.set(flightNumber, {
              flight_number: flightNumber,
