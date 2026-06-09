@@ -287,9 +287,16 @@ export const scanGmail = createServerFn({ method: "POST" })
       const subject = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "Subject")?.value ?? "?";
       
       // Look for KLM or Ryanair emails and grab their raw text for the console
+     // Look for KLM or Ryanair emails and grab their raw text for the console
       if (subject.toLowerCase().includes("klm") || subject.toLowerCase().includes("ryanair")) {
-         const rawText = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-         rawTextSamples.push(`[${subject}] -> \n${rawText.substring(0, 800)}`);
+         // Kill all CSS and Javascript blocks completely
+         let rawText = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ');
+         rawText = rawText.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ');
+         
+         // Now strip the remaining HTML tags and clean up spaces
+         rawText = rawText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+         
+         rawTextSamples.push(`[${subject}] -> \n${rawText.substring(0, 1500)}`);
       }
 
       const flights = parseFlightsFromPayload(msgData.payload);
