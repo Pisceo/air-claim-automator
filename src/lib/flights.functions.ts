@@ -349,10 +349,27 @@ export const scanGmail = createServerFn({ method: "POST" })
       departure_date:    f.departure_date,
     }));
 
-    await (supabase as any).from("flights").delete().eq("user_id", userId);
-
+    // Upsert: insert new, update existing, never duplicate
+    // onConflict matches the unique constraint — same flight+date = update not insert
     const { data: ins, error: insErr } = await (supabase as any)
-      .from("flights").insert(toInsert).select();
+      .from("flights")
+      .upsert(toInsert, { 
+        onConflict: "user_id,flight_number,departure_date",
+        ignoreDuplicates: false 
+      })
+      .select();
+
+    // Delete any flights no longer in the scan results
+    // (flights that were deleted from the map because they're no longer in reservations)
+    const currentKeys = toInsert.map(f => f.flight_number + "-" + f.departure_date);
+    const { data: existing } = await (supabase as any)
+      .from("flights").select("id,flight_number,departure_date").eq("user_id", userId);
+    const toDelete = (existing ?? [])
+      .filter((f: any) => !currentKeys.includes(f.flight_number + "-" + f.departure_date))
+      .map((f: any) => f.id);
+    if (toDelete.length) {
+      await (supabase as any).from("flights").delete().in("id", toDelete);
+    }
 
     return {
       detected: threads.length,
