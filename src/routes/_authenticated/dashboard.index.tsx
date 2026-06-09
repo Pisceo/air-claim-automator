@@ -33,19 +33,18 @@ function DashboardHome() {
   const scan = useMutation({
     mutationFn: () => scanFn(),
     onSuccess: async (r: any) => {
-      // ALWAYS log the debug info if it exists, before checking for errors
-      if (r?.debug?.parseDebug) {
-        console.log("PARSE DEBUG:", JSON.stringify(r.debug.parseDebug, null, 2));
+      // Print the raw text bucket directly to your browser console
+      if (r?.debug?.rawTextSamples?.length > 0) {
+        console.log("✈️ RAW TEXT EXTRACTED:");
+        r.debug.rawTextSamples.forEach((sample: string) => console.log(sample));
       }
 
-      // Handle the UI toast safely
       if (!r || r.error) {
         toast.error("Scan issue", { description: r?.error || "Server returned no data." });
       } else {
-        toast.success("Inbox scanned", { description: JSON.stringify(r.debug?.threadSubjects?.slice(0, 5)) });
+        toast.success("Inbox scanned", { description: "Check console for raw text." });
       }
       
-      // Wait for DB write to complete then force fresh fetch
       await new Promise(resolve => setTimeout(resolve, 1500));
       qc.removeQueries({ queryKey: ["flights"] });
       qc.removeQueries({ queryKey: ["claims"] });
