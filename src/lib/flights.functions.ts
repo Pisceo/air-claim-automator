@@ -332,6 +332,8 @@ export const scanGmail = createServerFn({ method: "POST" })
     if (!flightMap.size) {
       return {
         detected: threads.length,
+        threadsWithData: firstMessageIds.length,
+        batchKeys: [...messagesBatch.keys()].slice(0, 5),
         inserted: 0,
         error: "Reservation emails found but no structured flight data detected",
       };
@@ -354,6 +356,8 @@ export const scanGmail = createServerFn({ method: "POST" })
 
     return {
       detected: threads.length,
+      threadsWithData: firstMessageIds.length,
+      parsed: toInsert.length,
       inserted: ins?.length ?? 0,
       error: insErr?.message ?? null,
     };
