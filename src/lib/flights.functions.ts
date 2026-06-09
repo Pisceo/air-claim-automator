@@ -348,6 +348,16 @@ export const scanGmail = createServerFn({ method: "POST" })
       parsed: toInsert.length,
       inserted: toInsert.length,
       error: rpcErr?.message ?? null,
+      debug: {
+        threadSubjects: [...metaBatch.entries()].slice(0, 40).map(([id, td]) => {
+          const subj = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "Subject")?.value ?? "NO SUBJECT";
+          const from = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "From")?.value ?? "NO FROM";
+          const msgCount = td?.messages?.length ?? 0;
+          return `${subj} | FROM: ${from} | MSGS: ${msgCount}`;
+        }),
+        threadsWithNoStructuredData: threadsNeedingFallback.length,
+        flightMapKeys: [...flightMap.keys()],
+      },
     };
   });
 
