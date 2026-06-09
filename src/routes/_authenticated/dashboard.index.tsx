@@ -36,7 +36,8 @@ function DashboardHome() {
       if (r?.error) {
         toast.error("Scan issue", { description: r.error });
       } else {
-        toast.success("Inbox scanned", { description: `${r.inserted} inserted, ${r.parsed} parsed, ${r.threadsWithData} threads with data, ${r.detected} total threads` });
+        toast.success("Inbox scanned", { description: JSON.stringify(r.debug?.threadSubjects?.slice(0, 5)) });
+console.log("SCAN DEBUG:", JSON.stringify(r.debug, null, 2));
       }
       // Wait for DB write to complete then force fresh fetch
       await new Promise(resolve => setTimeout(resolve, 1500));
