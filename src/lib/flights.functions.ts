@@ -1,7 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 
-// ─── DECODE ──────────────────────────────────────────────────────────────────
+// ─── HELPERS ─────────────────────────────────────────────────────────────────
 
 function base64Decode(str: string): string {
   try {
@@ -14,25 +14,90 @@ function base64Decode(str: string): string {
   }
 }
 
-function getHtmlParts(payload: any, depth = 0): string[] {
-  if (depth > 4) return [];
-  const parts: string[] = [];
+function getHtml(payload: any, depth = 0): string {
+  if (depth > 4) return "";
+  let html = "";
   if (payload?.mimeType === "text/html" && payload?.body?.data) {
-    try { parts.push(base64Decode(payload.body.data)); } catch { /* skip */ }
+    try { html += base64Decode(payload.body.data); } catch { /* skip */ }
   }
   if (payload?.parts) {
     for (const p of payload.parts) {
       if (p.mimeType === "text/html" && p.body?.data) {
-        try { parts.push(base64Decode(p.body.data)); } catch { /* skip */ }
+        try { html += base64Decode(p.body.data); } catch { /* skip */ }
       } else if (p.mimeType?.startsWith("multipart/")) {
-        parts.push(...getHtmlParts(p, depth + 1));
+        html += getHtml(p, depth + 1);
       }
     }
   }
-  return parts;
+  return html;
 }
 
-// ─── STRUCTURED DATA EXTRACTION ──────────────────────────────────────────────
+// ─── GMAIL BATCH REQUEST ─────────────────────────────────────────────────────
+// One fetch() call containing multiple Gmail API requests.
+// Cloudflare counts this as exactly 1 subrequest.
+
+async function gmailBatch(
+  requests: { id: string; path: string }[],
+  token: string
+): Promise<Map<string, any>> {
+  const boundary = "flew_batch_" + Math.random().toString(36).slice(2);
+
+  const body = requests.map(r =>
+    `--${boundary}\r\nContent-Type: application/http\r\nContent-ID: <${r.id}>\r\n\r\nGET ${r.path}\r\n`
+  ).join("") + `--${boundary}--`;
+
+  const res = await fetch("https://gmail.googleapis.com/batch/gmail/v1", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": `multipart/mixed; boundary=${boundary}`,
+    },
+    body,
+  });
+
+  if (!res.ok) {
+    console.error("Batch request failed:", res.status, await res.text());
+    return new Map();
+  }
+
+  const text = await res.text();
+  const results = new Map<string, any>();
+
+  // Parse multipart/mixed response
+  // Each part looks like:
+  // --boundary
+  // Content-Type: application/http
+  // Content-ID: response-<id>
+  //
+  // HTTP/1.1 200 OK
+  // Content-Type: application/json
+  //
+  // {...json...}
+  const parts = text.split(/--[^\r\n]+\r\n/).slice(1);
+
+  for (const part of parts) {
+    if (!part || part.trim() === "--") continue;
+    try {
+      // Extract Content-ID
+      const idMatch = part.match(/Content-ID:\s*<response-([^>]+)>/i);
+      if (!idMatch) continue;
+      const id = idMatch[1];
+
+      // Find the JSON body (after the blank line separating HTTP headers from body)
+      const jsonStart = part.indexOf("\r\n\r\n", part.indexOf("HTTP/1.1"));
+      if (jsonStart === -1) continue;
+      const jsonStr = part.slice(jsonStart).trim();
+      if (!jsonStr || jsonStr === "--") continue;
+
+      const json = JSON.parse(jsonStr);
+      results.set(id, json);
+    } catch { continue; }
+  }
+
+  return results;
+}
+
+// ─── STRUCTURED DATA PARSERS ─────────────────────────────────────────────────
 
 interface ParsedFlight {
   flight_number: string;
@@ -52,7 +117,6 @@ const AIRLINE_NAMES: Record<string, string> = {
   SN: "Brussels Airlines", V7: "Volotea", BT: "airBaltic", PC: "Pegasus",
 };
 
-// JSON-LD: used by Qatar Airways, United, KLM booking confirmations
 function extractJsonLd(html: string): ParsedFlight[] {
   const results: ParsedFlight[] = [];
   for (const s of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
@@ -64,7 +128,6 @@ function extractJsonLd(html: string): ParsedFlight[] {
           for (const res of (Array.isArray(node) ? node : [node])) {
             const f = parseJsonLdNode(res);
             if (f) results.push(f);
-            // Also handle subReservation arrays (multi-leg trips)
             if (Array.isArray(res?.subReservation)) {
               for (const sub of res.subReservation) {
                 const sf = parseJsonLdNode(sub);
@@ -74,7 +137,7 @@ function extractJsonLd(html: string): ParsedFlight[] {
           }
         }
       }
-    } catch { /* invalid JSON */ }
+    } catch { /* skip */ }
   }
   return results;
 }
@@ -104,11 +167,9 @@ function parseJsonLdNode(node: any): ParsedFlight | null {
   };
 }
 
-// Microdata: used by Iberia, Turkish Airlines, most boarding pass emails
 function extractMicrodata(html: string): ParsedFlight[] {
   const results: ParsedFlight[] = [];
-  const openRe = /<[^>]+itemtype=["'][^"']*FlightReservation["'][^>]*>/gi;
-  for (const open of html.matchAll(openRe)) {
+  for (const open of html.matchAll(/<[^>]+itemtype=["'][^"']*FlightReservation["'][^>]*>/gi)) {
     const blockStart = (open.index ?? 0) + open[0].length;
     let depth = 1, pos = blockStart;
     while (pos < html.length && depth > 0) {
@@ -129,15 +190,13 @@ function parseMicrodataBlock(block: string): ParsedFlight | null {
     (block.match(new RegExp(`itemprop=["']${prop}["'][^>]*content=["']([^"'<>]+)["']`, "i")) ??
      block.match(new RegExp(`content=["']([^"'<>]+)["'][^>]*itemprop=["']${prop}["']`, "i")))?.[1]?.trim() ?? "";
 
-  const allIata = [
+  const seen = new Set<string>();
+  const codes = [
     ...block.matchAll(/itemprop=["']iataCode["'][^>]*content=["']([A-Z]{2,3})["']/gi),
     ...block.matchAll(/content=["']([A-Z]{2,3})["'][^>]*itemprop=["']iataCode["']/gi),
-  ].map(m => m[1].toUpperCase());
+  ].map(m => m[1].toUpperCase()).filter(c => { if (seen.has(c)) return false; seen.add(c); return true; });
 
-  const seen = new Set<string>();
-  const codes = allIata.filter(c => { if (seen.has(c)) return false; seen.add(c); return true; });
   if (!codes.length) return null;
-
   const airlineCode = codes[0];
   if (airlineCode.length !== 2) return null;
   const airports = codes.filter(c => c.length === 3);
@@ -163,13 +222,12 @@ function parseMicrodataBlock(block: string): ParsedFlight | null {
   };
 }
 
-function parseEmail(payload: any): ParsedFlight[] {
-  const htmlParts = getHtmlParts(payload);
-  const html = htmlParts.join("\n");
+function parseFlightsFromPayload(payload: any): ParsedFlight[] {
+  const html = getHtml(payload);
   if (!html) return [];
   if (html.includes("application/ld+json")) {
-    const results = extractJsonLd(html);
-    if (results.length) return results;
+    const r = extractJsonLd(html);
+    if (r.length) return r;
   }
   if (html.includes("FlightReservation")) {
     return extractMicrodata(html);
@@ -190,103 +248,96 @@ export const scanGmail = createServerFn({ method: "POST" })
     const googleToken = profileData?.gmail_access_token;
     if (!googleToken) return { detected: 0, inserted: 0, error: "No Gmail token — sign out and back in" };
 
-    // ── Step 1: Fetch threads (not messages) from category:reservations ───
-    // Using threads instead of messages means one booking = one thread.
-    // The first message in each thread is the original booking confirmation
-    // with structured data. Follow-ups (gate change, check-in, boarding)
-    // are later messages in the same thread — we skip them automatically.
-    // 54 emails → ~20 unique threads → well within 35 subrequest budget.
+    // ── Subrequest 1: List threads from category:reservations ─────────────
     const threadsRes = await fetch(
       `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=40`,
       { headers: { Authorization: `Bearer ${googleToken}` } }
     );
-
     if (!threadsRes.ok) {
       if (threadsRes.status === 401) return { detected: 0, inserted: 0, error: "Gmail token expired — sign out and back in" };
       return { detected: 0, inserted: 0, error: `Gmail error ${threadsRes.status}` };
     }
-
     const threadsData = await threadsRes.json();
     const threads: any[] = threadsData.threads ?? [];
     if (!threads.length) return { detected: 0, inserted: 0, error: "No reservation emails found in Gmail" };
 
-    // ── Step 2: For each thread, fetch the FIRST message only ─────────────
-    // threads/{id}?format=metadata returns all message IDs in the thread.
-    // We then fetch only messages[0] (original booking) with format=full.
-    // This costs 2 subrequests per thread (metadata + full first message).
-    // 20 threads × 2 = 40 subrequests + 1 list = 41 total. Fine.
-    //
-    // HOWEVER: to stay safe under 50, we fetch threads directly with
-    // format=full which returns all messages in the thread in one call.
-    // We then only parse the first message. 1 subrequest per thread.
+    // ── Subrequest 2: Batch fetch thread metadata for all threads ─────────
+    // Get the messages array for each thread (to find the first message ID).
+    // Up to 40 threads packed into ONE fetch() = 1 subrequest.
+    const metadataBatch = await gmailBatch(
+      threads.map(t => ({
+        id: t.id,
+        path: `/gmail/v1/users/me/threads/${t.id}?format=metadata&metadataHeaders=Subject`,
+      })),
+      googleToken
+    );
 
-    const flightMap = new Map<string, ParsedFlight>();
-    let threadsProcessed = 0;
+    // Extract the first (oldest) message ID from each thread
+    // and skip non-flight threads by subject
+    const SKIP_SUBJECTS = ["hotel", "car hire", "car rental", "restaurant",
+                           "train", "bus", "ferry", "cruise", "visa", "passport"];
+    const firstMessageIds: { threadId: string; messageId: string }[] = [];
 
     for (const thread of threads) {
-      // Stop if we're approaching the subrequest limit
-      // 1 (threads list) + N (thread fetches) + 1 (delete) + 1 (insert) < 50
-      if (threadsProcessed >= 45) break;
+      const threadData = metadataBatch.get(thread.id);
+      if (!threadData?.messages?.length) continue;
 
-      try {
-        const threadRes = await fetch(
-          // format=metadata is fast and returns message list with snippets
-          // We use it to get the oldest message ID cheaply
-          `https://gmail.googleapis.com/gmail/v1/users/me/threads/${thread.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From`,
-          { headers: { Authorization: `Bearer ${googleToken}` } }
-        );
-        threadsProcessed++;
-        if (!threadRes.ok) continue;
+      // messages[0] is the oldest = original booking confirmation
+      const firstMsg = threadData.messages[0];
+      const subjectHeader = firstMsg.payload?.headers?.find((h: any) => h.name === "Subject");
+      const subject = (subjectHeader?.value ?? "").toLowerCase();
 
-        const threadData = await threadRes.json();
-        const threadMessages: any[] = threadData.messages ?? [];
-        if (!threadMessages.length) continue;
+      if (SKIP_SUBJECTS.some(w => subject.includes(w))) continue;
 
-        // Get the oldest message in thread (index 0 = first/oldest)
-        // This is the original booking confirmation
-        const firstMsg = threadMessages[0];
+      firstMessageIds.push({ threadId: thread.id, messageId: firstMsg.id });
+    }
 
-        // Quick subject check from metadata to skip obvious non-flight threads
-        const subjectHeader = firstMsg.payload?.headers?.find((h: any) => h.name === "Subject");
-        const subject = (subjectHeader?.value ?? "").toLowerCase();
-        if (["hotel", "car hire", "car rental", "restaurant", "event", "concert", "train",
-             "bus", "ferry", "cruise", "visa", "passport"].some(w => subject.includes(w))) continue;
+    if (!firstMessageIds.length) {
+      return { detected: threads.length, inserted: 0, error: "No flight threads found after filtering" };
+    }
 
-        // Fetch full content of just this first message
-        const msgRes = await fetch(
-          `https://gmail.googleapis.com/gmail/v1/users/me/messages/${firstMsg.id}?format=full`,
-          { headers: { Authorization: `Bearer ${googleToken}` } }
-        );
-        threadsProcessed++;
-        if (!msgRes.ok) continue;
+    // ── Subrequest 3: Batch fetch full content of first message per thread ─
+    // All first-message fetches in ONE fetch() = 1 subrequest.
+    const messagesBatch = await gmailBatch(
+      firstMessageIds.map(({ messageId }) => ({
+        id: messageId,
+        path: `/gmail/v1/users/me/messages/${messageId}?format=full`,
+      })),
+      googleToken
+    );
 
-        const msgData = await msgRes.json();
-        const flights = parseEmail(msgData.payload);
+    // ── Parse structured data from each email ─────────────────────────────
+    const flightMap = new Map<string, ParsedFlight>();
 
-        for (const f of flights) {
-          if (!f.flight_number) continue;
-          const key = `${f.flight_number}-${f.departure_date ?? "nodate"}`;
-          if (!flightMap.has(key)) {
-            flightMap.set(key, f);
-          } else {
-            const ex = flightMap.get(key)!;
-            if (!ex.departure_airport && f.departure_airport) ex.departure_airport = f.departure_airport;
-            if (!ex.arrival_airport   && f.arrival_airport)   ex.arrival_airport   = f.arrival_airport;
-            if (!ex.departure_date    && f.departure_date)    ex.departure_date    = f.departure_date;
-          }
+    for (const { messageId } of firstMessageIds) {
+      const msgData = messagesBatch.get(messageId);
+      if (!msgData?.payload) continue;
+
+      const flights = parseFlightsFromPayload(msgData.payload);
+
+      for (const f of flights) {
+        if (!f.flight_number) continue;
+        const key = `${f.flight_number}-${f.departure_date ?? "nodate"}`;
+        if (!flightMap.has(key)) {
+          flightMap.set(key, f);
+        } else {
+          const ex = flightMap.get(key)!;
+          if (!ex.departure_airport && f.departure_airport) ex.departure_airport = f.departure_airport;
+          if (!ex.arrival_airport   && f.arrival_airport)   ex.arrival_airport   = f.arrival_airport;
+          if (!ex.departure_date    && f.departure_date)    ex.departure_date    = f.departure_date;
         }
-      } catch { continue; }
+      }
     }
 
     if (!flightMap.size) {
       return {
         detected: threads.length,
         inserted: 0,
-        error: "Reservation emails found but no structured flight data (JSON-LD/microdata) detected",
+        error: "Reservation emails found but no structured flight data detected",
       };
     }
 
-    // ── Step 3: Write to database ─────────────────────────────────────────
+    // ── Subrequests 4+5: Write to Supabase ────────────────────────────────
     const toInsert = [...flightMap.values()].map(f => ({
       user_id:           userId,
       flight_number:     f.flight_number,
