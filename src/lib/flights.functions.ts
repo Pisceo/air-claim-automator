@@ -171,7 +171,7 @@ function parseMicrodataBlock(block: string): ParsedFlight | null {
 
   // Format flight number correctly: IB + 0740 = IB0740
   const numPart = rawFlightNum.replace(/\D/g, "");
-  const flightNumber = `${airlineCode}${numPart}`;
+  const flightNumber = `${airlineCode}${parseInt(numPart, 10)}`;
 
   // Get departure date from departureTime ISO string
   const depTime = getMetaContent("departureTime");
@@ -436,7 +436,7 @@ export const scanGmail = createServerFn({ method: "POST" })
     let insertError = null;
     if (toInsert.length) {
       const { data: ins, error: insErr } = await (supabase as any)
-        .from("flights").insert(toInsert).select();
+        .from("flights").upsert(toInsert, { onConflict: "user_id,flight_number,departure_date", ignoreDuplicates: true }).select();
       if (insErr) insertError = insErr.message;
       else actuallyInserted = ins?.length ?? 0;
     }
