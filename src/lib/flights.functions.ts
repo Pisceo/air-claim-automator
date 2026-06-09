@@ -286,6 +286,14 @@ export const scanGmail = createServerFn({ method: "POST" })
       if (!msgData?.payload) { parseDebug.push(`${messageIds[0]}: NO PAYLOAD`); continue; }
       
       const html = getHtml(msgData.payload);
+      // TEMPORARY DIAGNOSTIC: Print the raw text of the email
+      const rawText = html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+      const subject = metaBatch.get(threadId)?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "Subject")?.value ?? "?";
+      
+      // Only log if it's KLM or Ryanair to keep the console clean
+      if (subject.toLowerCase().includes("klm") || subject.toLowerCase().includes("ryanair")) {
+        console.log(`RAW TEXT FOR [${subject}]:\n`, rawText.substring(0, 500)); // Just the first 500 chars
+      }
       const flights = parseFlightsFromPayload(msgData.payload);
       
       if (flights.length === 0 && messageIds.length > 1) {
