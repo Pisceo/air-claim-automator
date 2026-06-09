@@ -333,19 +333,18 @@ export const scanGmail = createServerFn({ method: "POST" })
       
       const html = getHtml(msgData.payload);
       const td = metaBatch.get(threadId);
-      const subject = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "Subject")?.value ?? "?";
       
-      // Look for KLM or Ryanair emails and grab their raw text for the console
-     // Look for KLM or Ryanair emails and grab their raw text for the console
-      if (subject.toLowerCase().includes("klm") || subject.toLowerCase().includes("ryanair")) {
-         // Kill all CSS and Javascript blocks completely
-         let rawText = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ');
-         rawText = rawText.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ');
-         
-         // Now strip the remaining HTML tags and clean up spaces
-         rawText = rawText.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
-         
-         rawTextSamples.push(`[${subject}] -> \n${rawText.substring(0, 1500)}`);
+      // Grab BOTH the Subject and the From headers
+      const subject = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "Subject")?.value ?? "?";
+      const fromAddress = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "From")?.value ?? "?";
+      
+      // Check if the SENDER is KLM, or the SUBJECT is Ryanair
+      if (fromAddress.toLowerCase().includes("klm") || subject.toLowerCase().includes("ryanair")) {
+         let rawText = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+                           .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+                           .replace(/<[^>]+>/g, ' ')
+                           .toUpperCase();
+         rawTextSamples.push(`[FROM: ${fromAddress}] [SUBJ: ${subject}] -> \n${rawText.substring(0, 1500)}`);
       }
 
       const flights = parseFlightsFromPayload(msgData.payload);
