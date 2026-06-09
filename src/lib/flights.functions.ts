@@ -48,7 +48,7 @@ function extractDateFromText(text: string, defaultYear: string): string | null {
   m = text.match(/\b(3[01]|[12]\d|0?[1-9])[-/](1[0-2]|0?[1-9])[-/](202[3-9])\b/);
   if (m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
 
-  const months = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+  const months = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SET","OCT","NOV","DEC"];
   const monthRegex = months.join("|");
   const ddmmyyyy = new RegExp(`\\b(3[01]|[12]\\d|0?[1-9])\\s+(${monthRegex})[A-Z]*\\s*(202[3-9])?\\b`, 'i');
   m = text.match(ddmmyyyy);
@@ -56,16 +56,6 @@ function extractDateFromText(text: string, defaultYear: string): string | null {
     const day = m[1].padStart(2, '0');
     const monthIdx = months.indexOf(m[2].toUpperCase()) + 1;
     const month = monthIdx.toString().padStart(2, '0');
-    const year = m[3] || defaultYear;
-    return `${year}-${month}-${day}`;
-  }
-
-  const mmddyyyy = new RegExp(`\\b(${monthRegex})[A-Z]*\\s+(3[01]|[12]\\d|0?[1-9])(?:ST|ND|RD|TH)?\\s*,?\\s*(202[3-9])?\\b`, 'i');
-  m = text.match(mmddyyyy);
-  if (m) {
-    const monthIdx = months.indexOf(m[1].toUpperCase()) + 1;
-    const month = monthIdx.toString().padStart(2, '0');
-    const day = m[2].padStart(2, '0');
     const year = m[3] || defaultYear;
     return `${year}-${month}-${day}`;
   }
@@ -257,6 +247,7 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
   const combinedText = `${subject} ${rawTextOriginal}`;
   const defaultYear = fallbackDate ? fallbackDate.substring(0, 4) : new Date().getFullYear().toString();
 
+  // 1. Structured Data Found Path
   if (flights.length > 0) {
     for (const f of flights) {
       if (!f.arrival_airport || !f.departure_airport) {
@@ -271,12 +262,13 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
         }
       }
       if (!f.departure_date) {
-        f.departure_date = extractDateFromText(combinedText.toUpperCase(), defaultYear);
+        f.departure_date = extractDateFromText(combinedText.toUpperCase(), defaultYear) || fallbackDate;
       }
     }
     return flights;
   }
 
+  // 2. Pure Text Fallback Path (KLM, EasyJet, etc.)
   const validCodes = Object.keys(AIRLINE_NAMES).join('|');
   const flightRegex = new RegExp(`\\b(${validCodes})\\s*(\\d{2,4})\\b`, 'gi');
   const flightMatches = [...combinedText.matchAll(flightRegex)];
@@ -287,11 +279,22 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
     for (const m of flightMatches) {
       const chunk = combinedText.substring(Math.max(0, m.index! - 150), Math.min(combinedText.length, m.index! + 150));
       
-      const localAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
-        .map(a => a[1]).filter(code => VALID_IATA_CODES.has(code));
+      // Look for clean structural routing codes (e.g. AMS-MAD, AMS/MAD, MAD TO AMS)
+      // This stops conversational acronyms like "SEA" from breaking routes
+      let localAirports = [...chunk.matchAll(/\b([A-Z]{3})\s*[-/→to]*\s*\b([A-Z]{3})\b/gi)]
+        .flatMap(match => [match[1].toUpperCase(), match[2].toUpperCase()])
+        .filter(code => VALID_IATA_CODES.has(code));
+
+      // If no explicit route syntax found, drop back to standard proximity scanning
+      if (localAirports.length < 2) {
+        localAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
+          .map(a => a[1].toUpperCase())
+          .filter(code => VALID_IATA_CODES.has(code));
+      }
 
       let flightDate = extractDateFromText(chunk.toUpperCase(), defaultYear);
       if (!flightDate) flightDate = extractDateFromText(combinedText.toUpperCase(), defaultYear);
+      if (!flightDate) flightDate = fallbackDate; // Safety Fallback
 
       if (localAirports.length >= 2 && flightDate) {
         const iata = m[1].toUpperCase();
@@ -328,8 +331,9 @@ export const scanGmail = createServerFn({ method: "POST" })
     const googleToken = profileData?.gmail_access_token;
     if (!googleToken) return { detected: 0, inserted: 0, error: "No Gmail token — sign out and back in" };
 
+    // FIX: Removed the older_than:300d time-gate. It now searches the entire frame up to today.
     const threadsRes = await fetch(
-      `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations older_than:300d newer_than:1095d")}&maxResults=100`,
+      `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=85`,
       { headers: { Authorization: `Bearer ${googleToken}` } }
     );
     if (!threadsRes.ok) {
@@ -391,7 +395,7 @@ export const scanGmail = createServerFn({ method: "POST" })
       }
       
       for (const f of flights) {
-        if (!f.flight_number || !f.departure_date) continue;
+        if (!f.flight_number || !f.departure_date) continue; // Must be valid data
         
         const cleanFlight = normalizeFlightNumber(f.flight_number);
         const key = `${cleanFlight}-${f.departure_date}`;
@@ -414,7 +418,7 @@ export const scanGmail = createServerFn({ method: "POST" })
     };
 
     if (!flightMap.size) {
-      return { detected: threads.length, inserted: 0, error: "No structured flight data found in reservation emails", debug: debugData };
+      return { detected: threads.length, inserted: 0, error: "No flight data detected", debug: debugData };
     }
 
     const validFlights = [...flightMap.values()].filter(f => f.departure_date !== null);
@@ -429,7 +433,7 @@ export const scanGmail = createServerFn({ method: "POST" })
     }));
 
     if (toInsert.length === 0) {
-      return { detected: threads.length, parsed: validFlights.length, inserted: 0, error: "Found flights, but none had valid dates.", debug: debugData };
+      return { detected: threads.length, parsed: validFlights.length, inserted: 0, error: "No flights with valid dates found.", debug: debugData };
     }
 
     const { error: rpcErr } = await (supabase as any).rpc("upsert_flights", {
