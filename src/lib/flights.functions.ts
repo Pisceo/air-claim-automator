@@ -127,6 +127,13 @@ const VALID_IATA_CODES = new Set([
   "JNB", "CPT", "CAI", "CMN", "ADD", "NBO"
 ]);
 
+// Global city mapper to instantly extract routes from high-confidence subject lines
+const CITY_TO_IATA: Record<string, string> = {
+  "MADRID": "MAD", "AMSTERDAM": "AMS", "STANSTED": "STN", "LONDON": "STN",
+  "HONG KONG": "HKG", "HONGKONG": "HKG", "ISTANBUL": "IST", "BRUSSELS": "BRU", 
+  "HOUSTON": "IAH", "SAN SALVADOR": "SAL", "NEW ORLEANS": "MSY", "DOHA": "DOH"
+};
+
 function extractJsonLd(html: string): ParsedFlight[] {
   const results: ParsedFlight[] = [];
   for (const s of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
@@ -229,27 +236,14 @@ function parseMicrodataBlock(block: string): ParsedFlight | null {
   };
 }
 
-// ─── UNIVERSAL PARSER WITH TELEMETRY ──────────────────────────────────────────
+// ─── UNIVERSAL PARSER ────────────────────────────────────────────────────────
 
-interface DiagnosticReport {
-  subject: string;
-  hasStructuredData: boolean;
-  detectedFlightMatches: string[];
-  extractedAirportsInChunk: string[];
-  extractedDate: string | null;
-  outcome: string;
-}
-
-function parseFlightsWithTelemetry(
-  payload: any, 
-  subject: string, 
-  fallbackDate: string | null,
-  logBucket: DiagnosticReport[]
-): ParsedFlight[] {
+function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDate: string | null = null): ParsedFlight[] {
   const html = getHtml(payload);
   if (!html) return [];
   
   let flights: ParsedFlight[] = [];
+  
   if (html.includes("application/ld+json")) flights = flights.concat(extractJsonLd(html));
   if (html.includes("FlightReservation")) flights = flights.concat(extractMicrodata(html));
 
@@ -257,34 +251,40 @@ function parseFlightsWithTelemetry(
                             .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
                             .replace(/<[^>]+>/g, ' ');
   
-  const combinedText = `${subject} ${rawTextOriginal}`;
+  const subjectUpper = subject.toUpperCase();
+  const combinedText = `${subjectUpper} ${rawTextOriginal}`;
   const defaultYear = fallbackDate ? fallbackDate.substring(0, 4) : "2026";
 
-  // Case 1: Standard structured data path
+  // Phase 1: Scan the subject line for high-confidence explicit city routes
+  const subjectAirports: string[] = [];
+  for (const [city, code] of Object.entries(CITY_TO_IATA)) {
+    if (subjectUpper.includes(city)) {
+      subjectAirports.push(code);
+    }
+  }
+
+  // If structured data exists, patch missing holes using high-confidence subject maps
   if (flights.length > 0) {
     for (const f of flights) {
-      if (!f.arrival_airport || !f.departure_airport) {
-        const foundAirports = [...combinedText.matchAll(/\b([A-Z]{3})\b/g)]
-          .map(m => m[1]).filter(code => VALID_IATA_CODES.has(code));
-        if (foundAirports.length > 0) {
-          if (!f.departure_airport) f.departure_airport = foundAirports[0];
-          if (!f.arrival_airport && foundAirports.length > 1) f.arrival_airport = foundAirports[1];
+      if (!f.departure_airport && subjectAirports[0]) f.departure_airport = subjectAirports[0];
+      if (!f.arrival_airport && subjectAirports[1]) f.arrival_airport = subjectAirports[1];
+      
+      if (!f.departure_airport || !f.arrival_airport) {
+        const globalAirports = [...combinedText.matchAll(/\b([A-Z]{3})\b/g)]
+          .map(m => m[1].toUpperCase()).filter(code => VALID_IATA_CODES.has(code));
+        if (globalAirports.length > 0) {
+          if (!f.departure_airport) f.departure_airport = globalAirports[0];
+          if (!f.arrival_airport && globalAirports.length > 1) f.arrival_airport = globalAirports[1];
         }
       }
-      if (!f.departure_date) f.departure_date = extractDateFromText(combinedText, defaultYear) || fallbackDate;
+      if (!f.departure_date) {
+        f.departure_date = extractDateFromText(combinedText.toUpperCase(), defaultYear) || fallbackDate;
+      }
     }
-    logBucket.push({
-      subject,
-      hasStructuredData: true,
-      detectedFlightMatches: flights.map(f => f.flight_number),
-      extractedAirportsInChunk: flights.map(f => `${f.departure_airport}->${f.arrival_airport}`),
-      extractedDate: flights[0]?.departure_date,
-      outcome: "SUCCESS (Structured Data)"
-    });
     return flights;
   }
 
-  // Case 2: Text fallback path
+  // Phase 2: Text Fallback Path (KLM, EasyJet, etc.)
   const validCodes = Object.keys(AIRLINE_NAMES).join('|');
   const flightRegex = new RegExp(`\\b(${validCodes})\\s*(\\d{2,4})\\b`, 'gi');
   const flightMatches = [...combinedText.matchAll(flightRegex)];
@@ -292,63 +292,55 @@ function parseFlightsWithTelemetry(
   if (flightMatches.length > 0) {
     const uniqueFlights = new Map<string, ParsedFlight>();
     
-    for (const m of flightMatches) {
-      const chunk = combinedText.substring(Math.max(0, m.index! - 150), Math.min(combinedText.length, m.index! + 150));
-      
-      const localAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
-        .map(a => a[1].toUpperCase())
-        .filter(code => VALID_IATA_CODES.has(code));
+    // Scan the entire document for valid uppercase IATA codes up front
+    const allBodyAirports = [...rawTextOriginal.matchAll(/\b([A-Z]{3})\b/g)]
+      .map(m => m[1].toUpperCase())
+      .filter(code => VALID_IATA_CODES.has(code) && code !== "SEA"); // Hard block conversational acronym leaks
 
-      let flightDate = extractDateFromText(chunk, defaultYear);
-      if (!flightDate) flightDate = extractDateFromText(combinedText, defaultYear);
+    for (const m of flightMatches) {
+      const iata = m[1].toUpperCase();
+      const num = m[2];
+      const flightNumber = `${iata}${num}`;
+
+      // Set baseline target airports using high-confidence subject line routing map
+      let dep = subjectAirports[0] || null;
+      let arr = subjectAirports[1] || null;
+
+      // If subject line is blind, scan local proximity chunk windows
+      const chunk = combinedText.substring(Math.max(0, m.index! - 200), Math.min(combinedText.length, m.index! + 200));
+      let localAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
+        .map(a => a[1].toUpperCase())
+        .filter(code => VALID_IATA_CODES.has(code) && code !== "SEA");
+
+      if (!dep && localAirports[0]) dep = localAirports[0];
+      if (!arr && localAirports.length > 1) arr = localAirports.find(a => a !== dep) || null;
+
+      // If proximity chunk is blind (KLM open-table rows), scale out to the entire text block assets
+      if ((!dep || !arr) && flightMatches.length === 1) {
+        if (!dep && allBodyAirports[0]) dep = allBodyAirports[0];
+        if (!arr && allBodyAirports.length > 1) arr = allBodyAirports.find(a => a !== dep) || null;
+      }
+
+      let flightDate = extractDateFromText(chunk.toUpperCase(), defaultYear);
+      if (!flightDate) flightDate = extractDateFromText(combinedText.toUpperCase(), defaultYear);
       if (!flightDate) flightDate = fallbackDate;
 
-      if (localAirports.length >= 2 && flightDate) {
-        const iata = m[1].toUpperCase();
-        const num = m[2];
-        const flightNumber = `${iata}${num}`;
-
-        uniqueFlights.set(flightNumber, {
-          flight_number: flightNumber,
-          airline: AIRLINE_NAMES[iata] || iata,
-          departure_airport: localAirports[0],
-          arrival_airport: localAirports.find(a => a !== localAirports[0]) || null,
-          departure_date: flightDate
-        });
-      } else {
-        logBucket.push({
-          subject,
-          hasStructuredData: false,
-          detectedFlightMatches: [m[0]],
-          extractedAirportsInChunk: localAirports,
-          extractedDate: flightDate,
-          outcome: `DROPPED (Required 2 airports and date inside chunk. Found airports: ${localAirports.length}, Date: ${flightDate ? "YES" : "NO"})`
-        });
+      // Ensure we have a valid structural definition before building database entries
+      if (dep && arr && flightDate) {
+        if (!uniqueFlights.has(flightNumber)) {
+           uniqueFlights.set(flightNumber, {
+             flight_number: flightNumber,
+             airline: AIRLINE_NAMES[iata] || iata,
+             departure_airport: dep,
+             arrival_airport: arr,
+             departure_date: flightDate
+           });
+        }
       }
     }
-    
-    if (uniqueFlights.size > 0) {
-      const finalFlights = Array.from(uniqueFlights.values());
-      logBucket.push({
-        subject,
-        hasStructuredData: false,
-        detectedFlightMatches: finalFlights.map(f => f.flight_number),
-        extractedAirportsInChunk: finalFlights.map(f => `${f.departure_airport}->${f.arrival_airport}`),
-        extractedDate: finalFlights[0]?.departure_date,
-        outcome: "SUCCESS (Text Fallback)"
-      });
-      return finalFlights;
-    }
+    return Array.from(uniqueFlights.values());
   }
 
-  logBucket.push({
-    subject,
-    hasStructuredData: false,
-    detectedFlightMatches: [],
-    extractedAirportsInChunk: [],
-    extractedDate: null,
-    outcome: "SKIPPED (No flight pattern found)"
-  });
   return [];
 }
 
@@ -397,13 +389,16 @@ export const scanGmail = createServerFn({ method: "POST" })
       threadMessageIds.push({ threadId: thread.id, messageIds: ids });
     }
 
+    if (!threadMessageIds.length) return { detected: threads.length, inserted: 0, error: "No flight threads found" };
+
+    const allFirstIds = threadMessageIds.map(t => t.messageIds[0]);
     const firstBatch = await gmailBatch(
-      threadMessageIds.map(t => ({ id: t.messageIds[0], path: `/gmail/v1/users/me/messages/${t.messageIds[0]}?format=full` })),
+      allFirstIds.map(id => ({ id, path: `/gmail/v1/users/me/messages/${id}?format=full` })),
       googleToken
     );
 
     const flightMap = new Map<string, ParsedFlight>();
-    const deepTelemetry: DiagnosticReport[] = [];
+    const threadsNeedingFallback: string[] = [];
 
     for (const { threadId, messageIds } of threadMessageIds) {
       const msgData = firstBatch.get(messageIds[0]);
@@ -416,10 +411,16 @@ export const scanGmail = createServerFn({ method: "POST" })
         fallbackDate = new Date(parseInt(msgData.internalDate)).toISOString().split("T")[0];
       }
       
-      const flights = parseFlightsWithTelemetry(msgData.payload, subject, fallbackDate, deepTelemetry);
+      const flights = parseFlightsFromPayload(msgData.payload, subject, fallbackDate);
+      
+      if (flights.length === 0 && messageIds.length > 1) {
+        threadsNeedingFallback.push(...messageIds.slice(1));
+        continue;
+      }
       
       for (const f of flights) {
         if (!f.flight_number || !f.departure_date) continue;
+        
         const cleanFlight = normalizeFlightNumber(f.flight_number);
         const key = `${cleanFlight}-${f.departure_date}`;
         
@@ -437,7 +438,7 @@ export const scanGmail = createServerFn({ method: "POST" })
 
     const validFlights = [...flightMap.values()];
     if (validFlights.length === 0) {
-      return { detected: threads.length, inserted: 0, error: "No flights parsed", debug: { deepTelemetry } };
+      return { detected: threads.length, inserted: 0, error: "No flights detected" };
     }
 
     const toInsert = validFlights.map(f => ({
@@ -456,7 +457,6 @@ export const scanGmail = createServerFn({ method: "POST" })
       parsed: toInsert.length,
       inserted: toInsert.length,
       error: rpcErr?.message ?? null,
-      debug: { deepTelemetry },
     };
   });
 
