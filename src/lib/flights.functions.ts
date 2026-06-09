@@ -384,7 +384,7 @@ export const scanGmail = createServerFn({ method: "POST" })
     if (!googleToken) return { detected: 0, inserted: 0, error: "No Gmail token — sign out and back in" };
 
     const threadsRes = await fetch(
-      `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=60`,
+      `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=80`,
       { headers: { Authorization: `Bearer ${googleToken}` } }
     );
     if (!threadsRes.ok) {
