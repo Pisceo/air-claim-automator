@@ -206,17 +206,66 @@ function parseMicrodataBlock(block: string): ParsedFlight | null {
   };
 }
 
+// A strict dictionary of valid global IATA codes. Add to this as your user base grows.
+const VALID_IATA_CODES = new Set([
+  // Europe
+  "MAD", "AMS", "STN", "LHR", "LGW", "BGY", "IST", "BRU", "CDG", "FRA", "MUC", "BCN", 
+  "FCO", "MXP", "ATH", "LIS", "VIE", "CPH", "OSL", "ARN", "HEL", "DUB", "ZRH", "GVA", 
+  "WAW", "PRG", "BUD", "OTP", "PMI", "AGP", "ALC", "VLC", "SVQ", "BIO", "EDI", "MAN",
+  // Americas
+  "JFK", "IAH", "SAL", "EWR", "ORD", "LAX", "SFO", "MIA", "BOS", "IAD", "YYZ", "YVR", 
+  "MEX", "BOG", "GRU", "EZE", "SCL", "LIM", "PTY", "ATL", "DFW", "DEN", "LAS", "SEA",
+  // Asia / Middle East / Oceania
+  "HKG", "DOH", "DXB", "NRT", "HND", "ICN", "PEK", "PVG", "SIN", "BKK", "KUL", "CGK", 
+  "SYD", "MEL", "AKL", "DEL", "BOM", "AUH", "JED", "RUH",
+  // Africa
+  "JNB", "CPT", "CAI", "CMN", "ADD", "NBO"
+]);
+
 function parseFlightsFromPayload(payload: any): ParsedFlight[] {
   const html = getHtml(payload);
   if (!html) return [];
   
   let flights: ParsedFlight[] = [];
+  
+  // 1. Try Structured Data first
   if (html.includes("application/ld+json")) {
     flights = flights.concat(extractJsonLd(html));
   }
   if (html.includes("FlightReservation")) {
     flights = flights.concat(extractMicrodata(html));
   }
+
+  // 2. SURGICAL PATCH: Fix missing airports using the Strict Dictionary
+  // If structured data found the flight but missed an airport (like Ryanair does)
+  if (flights.length > 0) {
+    for (const f of flights) {
+      if (!f.arrival_airport || !f.departure_airport) {
+        
+        // Kill CSS/JS, strip HTML, and convert to uppercase
+        let rawText = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+                          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+                          .replace(/<[^>]+>/g, ' ')
+                          .toUpperCase();
+
+        // Extract 3-letter words, but ONLY keep them if they exist in our Strict Dictionary
+        const foundAirports = [...rawText.matchAll(/\b([A-Z]{3})\b/g)]
+          .map(m => m[1])
+          .filter(code => VALID_IATA_CODES.has(code));
+
+        if (foundAirports.length > 0) {
+          // Patch the missing departure airport
+          if (!f.departure_airport) f.departure_airport = foundAirports[0];
+          
+          // Patch the missing arrival airport (make sure it's not the same as departure)
+          if (!f.arrival_airport && foundAirports.length > 1) {
+            f.arrival_airport = foundAirports.find(a => a !== f.departure_airport) || null;
+          }
+        }
+      }
+    }
+  }
+
   return flights;
 }
 
