@@ -41,29 +41,56 @@ function normalizeFlightNumber(fn: string): string {
   return clean;
 }
 
+// Scans text for actual flight dates (e.g. "28 May", "16/03/2026", "2024-01-03")
+function extractDateFromText(text: string, defaultYear: string): string | null {
+  // 1. YYYY-MM-DD or YYYY/MM/DD
+  let m = text.match(/\b(202[3-9])[-/](1[0-2]|0?[1-9])[-/](3[01]|[12]\d|0?[1-9])\b/);
+  if (m) return `${m[1]}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`;
+
+  // 2. DD/MM/YYYY or DD-MM-YYYY
+  m = text.match(/\b(3[01]|[12]\d|0?[1-9])[-/](1[0-2]|0?[1-9])[-/](202[3-9])\b/);
+  if (m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+
+  // 3. DD MMM YYYY or DD MMM (e.g., 28 MAY)
+  const months = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+  const monthRegex = months.join("|");
+  const ddmmyyyy = new RegExp(`\\b(3[01]|[12]\\d|0?[1-9])\\s+(${monthRegex})[A-Z]*\\s*(202[3-9])?\\b`);
+  m = text.match(ddmmyyyy);
+  if (m) {
+    const day = m[1].padStart(2, '0');
+    const monthIdx = months.indexOf(m[2]) + 1;
+    const month = monthIdx.toString().padStart(2, '0');
+    const year = m[3] || defaultYear;
+    return `${year}-${month}-${day}`;
+  }
+
+  // 4. MMM DD YYYY or MMM DD (e.g., MAY 28)
+  const mmddyyyy = new RegExp(`\\b(${monthRegex})[A-Z]*\\s+(3[01]|[12]\\d|0?[1-9])(?:ST|ND|RD|TH)?\\s*,?\\s*(202[3-9])?\\b`);
+  m = text.match(mmddyyyy);
+  if (m) {
+    const monthIdx = months.indexOf(m[1]) + 1;
+    const month = monthIdx.toString().padStart(2, '0');
+    const day = m[2].padStart(2, '0');
+    const year = m[3] || defaultYear;
+    return `${year}-${month}-${day}`;
+  }
+
+  return null;
+}
+
 // ─── GMAIL BATCH ─────────────────────────────────────────────────────────────
 
-async function gmailBatch(
-  requests: { id: string; path: string }[],
-  token: string
-): Promise<Map<string, any>> {
+async function gmailBatch(requests: { id: string; path: string }[], token: string): Promise<Map<string, any>> {
   const boundary = "flew_" + Math.random().toString(36).slice(2);
-  const body = requests.map(r =>
-    `--${boundary}\r\nContent-Type: application/http\r\nContent-ID: <${r.id}>\r\n\r\nGET ${r.path}\r\n`
-  ).join("") + `--${boundary}--`;
+  const body = requests.map(r => `--${boundary}\r\nContent-Type: application/http\r\nContent-ID: <${r.id}>\r\n\r\nGET ${r.path}\r\n`).join("") + `--${boundary}--`;
 
   const res = await fetch("https://gmail.googleapis.com/batch/gmail/v1", {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${token}`,
-      "Content-Type": `multipart/mixed; boundary=${boundary}`,
-    },
+    headers: { "Authorization": `Bearer ${token}`, "Content-Type": `multipart/mixed; boundary=${boundary}` },
     body,
   });
 
-  if (!res.ok) {
-    return new Map();
-  }
+  if (!res.ok) return new Map();
 
   const text = await res.text();
   const results = new Map<string, any>();
@@ -104,7 +131,7 @@ const AIRLINE_NAMES: Record<string, string> = {
   SN: "Brussels Airlines", V7: "Volotea", BT: "airBaltic", PC: "Pegasus",
 };
 
-// Strict dictionary of valid global IATA codes.
+// Removed "LAS" and "LOS" to prevent Spanish language collisions
 const VALID_IATA_CODES = new Set([
   // Europe
   "MAD", "AMS", "STN", "LHR", "LGW", "BGY", "IST", "BRU", "CDG", "FRA", "MUC", "BCN", 
@@ -112,7 +139,7 @@ const VALID_IATA_CODES = new Set([
   "WAW", "PRG", "BUD", "OTP", "PMI", "AGP", "ALC", "VLC", "SVQ", "BIO", "EDI", "MAN",
   // Americas
   "JFK", "IAH", "SAL", "EWR", "ORD", "LAX", "SFO", "MIA", "BOS", "IAD", "YYZ", "YVR", 
-  "MEX", "BOG", "GRU", "EZE", "SCL", "LIM", "PTY", "ATL", "DFW", "DEN", "LAS", "SEA",
+  "MEX", "BOG", "GRU", "EZE", "SCL", "LIM", "PTY", "ATL", "DFW", "DEN", "SEA", "MSY",
   // Asia / Middle East / Oceania
   "HKG", "DOH", "DXB", "NRT", "HND", "ICN", "PEK", "PVG", "SIN", "BKK", "KUL", "CGK", 
   "SYD", "MEL", "AKL", "DEL", "BOM", "AUH", "JED", "RUH",
@@ -241,6 +268,7 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
                     .toUpperCase();
   
   const combinedText = `${subject.toUpperCase()} ${rawText}`;
+  const defaultYear = fallbackDate ? fallbackDate.substring(0, 4) : new Date().getFullYear().toString();
 
   // 2. SURGICAL PATCH: Fix missing data for structured flights (like Ryanair)
   if (flights.length > 0) {
@@ -256,7 +284,11 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
           }
         }
       }
-      if (!f.departure_date && fallbackDate) f.departure_date = fallbackDate;
+      // Only assign a fallback date if we found a REAL date in the text. 
+      // Do not use the email sent date, it creates ghost flights.
+      if (!f.departure_date) {
+        f.departure_date = extractDateFromText(combinedText, defaultYear);
+      }
     }
     return flights;
   }
@@ -267,12 +299,21 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
   const flightMatches = [...combinedText.matchAll(flightRegex)];
 
   if (flightMatches.length > 0) {
-    const foundAirports = [...combinedText.matchAll(/\b([A-Z]{3})\b/g)]
-      .map(m => m[1]).filter(code => VALID_IATA_CODES.has(code));
+    const uniqueFlights = new Map<string, ParsedFlight>();
+    
+    for (const m of flightMatches) {
+      // Create a 150-character proximity chunk to prevent connecting flights from stealing airports
+      const chunk = combinedText.substring(Math.max(0, m.index! - 150), Math.min(combinedText.length, m.index! + 150));
+      
+      const localAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
+        .map(a => a[1]).filter(code => VALID_IATA_CODES.has(code));
 
-    if (foundAirports.length >= 2) {
-      const uniqueFlights = new Map<string, ParsedFlight>();
-      for (const m of flightMatches) {
+      // Hunt for a date locally first, then expand to the whole email
+      let flightDate = extractDateFromText(chunk, defaultYear);
+      if (!flightDate) flightDate = extractDateFromText(combinedText, defaultYear);
+
+      // We ONLY insert the fallback flight if we confidently found a date and 2 airports
+      if (localAirports.length >= 2 && flightDate) {
         const iata = m[1];
         const num = m[2];
         const flightNumber = `${iata}${num}`;
@@ -281,14 +322,14 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
            uniqueFlights.set(flightNumber, {
              flight_number: flightNumber,
              airline: AIRLINE_NAMES[iata] || iata,
-             departure_airport: foundAirports[0],
-             arrival_airport: foundAirports.find(a => a !== foundAirports[0]) || null,
-             departure_date: fallbackDate
+             departure_airport: localAirports[0],
+             arrival_airport: localAirports.find(a => a !== localAirports[0]) || null,
+             departure_date: flightDate
            });
         }
       }
-      return Array.from(uniqueFlights.values());
     }
+    return Array.from(uniqueFlights.values());
   }
 
   return flights;
@@ -362,7 +403,6 @@ export const scanGmail = createServerFn({ method: "POST" })
         fallbackDate = new Date(parseInt(msgData.internalDate)).toISOString().split("T")[0];
       }
       
-      // Feed the universal parser everything it needs
       const flights = parseFlightsFromPayload(msgData.payload, subject, fallbackDate);
       
       if (flights.length === 0 && messageIds.length > 1) {
@@ -371,10 +411,10 @@ export const scanGmail = createServerFn({ method: "POST" })
       }
       
       for (const f of flights) {
-        if (!f.flight_number) continue;
+        if (!f.flight_number || !f.departure_date) continue; // Require a date
         
         const cleanFlight = normalizeFlightNumber(f.flight_number);
-        const key = `${cleanFlight}-${f.departure_date ?? "nodate"}`;
+        const key = `${cleanFlight}-${f.departure_date}`;
         
         if (!flightMap.has(key)) {
           f.flight_number = cleanFlight;
@@ -384,12 +424,6 @@ export const scanGmail = createServerFn({ method: "POST" })
           if (!ex.departure_airport && f.departure_airport) ex.departure_airport = f.departure_airport;
           if (!ex.arrival_airport && f.arrival_airport) ex.arrival_airport = f.arrival_airport;
           if (!ex.airline && f.airline) ex.airline = f.airline;
-          
-          if (!ex.departure_date && f.departure_date) {
-            ex.departure_date = f.departure_date;
-            flightMap.delete(key);
-            flightMap.set(`${cleanFlight}-${f.departure_date}`, ex);
-          }
         }
       }
     }
@@ -400,12 +434,7 @@ export const scanGmail = createServerFn({ method: "POST" })
     };
 
     if (!flightMap.size) {
-      return { 
-        detected: threads.length, 
-        inserted: 0, 
-        error: "No structured flight data found in reservation emails",
-        debug: debugData 
-      };
+      return { detected: threads.length, inserted: 0, error: "No structured flight data found in reservation emails", debug: debugData };
     }
 
     const validFlights = [...flightMap.values()].filter(f => f.departure_date !== null);
