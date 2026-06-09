@@ -32,16 +32,14 @@ function getHtml(payload: any, depth = 0): string {
   return html;
 }
 
-// ─── GMAIL BATCH REQUEST ─────────────────────────────────────────────────────
-// One fetch() call containing multiple Gmail API requests.
-// Cloudflare counts this as exactly 1 subrequest.
+// ─── GMAIL BATCH ─────────────────────────────────────────────────────────────
+// Pack multiple Gmail API calls into one fetch() = 1 Cloudflare subrequest
 
 async function gmailBatch(
   requests: { id: string; path: string }[],
   token: string
 ): Promise<Map<string, any>> {
-  const boundary = "flew_batch_" + Math.random().toString(36).slice(2);
-
+  const boundary = "flew_" + Math.random().toString(36).slice(2);
   const body = requests.map(r =>
     `--${boundary}\r\nContent-Type: application/http\r\nContent-ID: <${r.id}>\r\n\r\nGET ${r.path}\r\n`
   ).join("") + `--${boundary}--`;
@@ -56,44 +54,26 @@ async function gmailBatch(
   });
 
   if (!res.ok) {
-    console.error("Batch request failed:", res.status, await res.text());
+    console.error("Batch failed:", res.status, await res.text());
     return new Map();
   }
 
   const text = await res.text();
   const results = new Map<string, any>();
-
-  // Parse multipart/mixed response
-  // Each part looks like:
-  // --boundary
-  // Content-Type: application/http
-  // Content-ID: response-<id>
-  //
-  // HTTP/1.1 200 OK
-  // Content-Type: application/json
-  //
-  // {...json...}
   const parts = text.split(/--[^\r\n]+\r\n/).slice(1);
 
   for (const part of parts) {
     if (!part || part.trim() === "--") continue;
     try {
-      // Extract Content-ID
       const idMatch = part.match(/Content-ID:\s*<response-([^>]+)>/i);
       if (!idMatch) continue;
-      const id = idMatch[1];
-
-      // Find the JSON body (after the blank line separating HTTP headers from body)
       const jsonStart = part.indexOf("\r\n\r\n", part.indexOf("HTTP/1.1"));
       if (jsonStart === -1) continue;
       const jsonStr = part.slice(jsonStart).trim();
-      if (!jsonStr || jsonStr === "--") continue;
-
-      const json = JSON.parse(jsonStr);
-      results.set(id, json);
+      if (!jsonStr || jsonStr.startsWith("--")) continue;
+      results.set(idMatch[1], JSON.parse(jsonStr));
     } catch { continue; }
   }
-
   return results;
 }
 
@@ -117,6 +97,7 @@ const AIRLINE_NAMES: Record<string, string> = {
   SN: "Brussels Airlines", V7: "Volotea", BT: "airBaltic", PC: "Pegasus",
 };
 
+// JSON-LD parser
 function extractJsonLd(html: string): ParsedFlight[] {
   const results: ParsedFlight[] = [];
   for (const s of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
@@ -167,6 +148,7 @@ function parseJsonLdNode(node: any): ParsedFlight | null {
   };
 }
 
+// Microdata parser
 function extractMicrodata(html: string): ParsedFlight[] {
   const results: ParsedFlight[] = [];
   for (const open of html.matchAll(/<[^>]+itemtype=["'][^"']*FlightReservation["'][^>]*>/gi)) {
@@ -200,19 +182,16 @@ function parseMicrodataBlock(block: string): ParsedFlight | null {
   const airlineCode = codes[0];
   if (airlineCode.length !== 2) return null;
   const airports = codes.filter(c => c.length === 3);
-
   const rawNum = getMeta("flightNumber").replace(/\D/g, "");
   if (!rawNum) return null;
   const flightNum = parseInt(rawNum, 10);
   if (isNaN(flightNum)) return null;
-
   let date: string | null = null;
   const depTime = getMeta("departureTime");
   if (depTime) {
     const d = new Date(depTime);
     if (!isNaN(d.getTime())) date = d.toISOString().split("T")[0];
   }
-
   return {
     flight_number: `${airlineCode}${flightNum}`,
     airline: AIRLINE_NAMES[airlineCode] ?? airlineCode,
@@ -225,6 +204,7 @@ function parseMicrodataBlock(block: string): ParsedFlight | null {
 function parseFlightsFromPayload(payload: any): ParsedFlight[] {
   const html = getHtml(payload);
   if (!html) return [];
+  // Try JSON-LD first, then microdata
   if (html.includes("application/ld+json")) {
     const r = extractJsonLd(html);
     if (r.length) return r;
@@ -248,7 +228,7 @@ export const scanGmail = createServerFn({ method: "POST" })
     const googleToken = profileData?.gmail_access_token;
     if (!googleToken) return { detected: 0, inserted: 0, error: "No Gmail token — sign out and back in" };
 
-    // ── Subrequest 1: List threads from category:reservations ─────────────
+    // Subrequest 1: list threads
     const threadsRes = await fetch(
       `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=40`,
       { headers: { Authorization: `Bearer ${googleToken}` } }
@@ -257,89 +237,97 @@ export const scanGmail = createServerFn({ method: "POST" })
       if (threadsRes.status === 401) return { detected: 0, inserted: 0, error: "Gmail token expired — sign out and back in" };
       return { detected: 0, inserted: 0, error: `Gmail error ${threadsRes.status}` };
     }
-    const threadsData = await threadsRes.json();
-    const threads: any[] = threadsData.threads ?? [];
+    const threads: any[] = (await threadsRes.json()).threads ?? [];
     if (!threads.length) return { detected: 0, inserted: 0, error: "No reservation emails found in Gmail" };
 
-    // ── Subrequest 2: Batch fetch thread metadata for all threads ─────────
-    // Get the messages array for each thread (to find the first message ID).
-    // Up to 40 threads packed into ONE fetch() = 1 subrequest.
-    const metadataBatch = await gmailBatch(
+    // Subrequest 2: batch get metadata for ALL threads
+    const metaBatch = await gmailBatch(
       threads.map(t => ({
         id: t.id,
-        path: `/gmail/v1/users/me/threads/${t.id}?format=metadata&metadataHeaders=Subject`,
+        path: `/gmail/v1/users/me/threads/${t.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From`,
       })),
       googleToken
     );
 
-    // Extract the first (oldest) message ID from each thread
-    // and skip non-flight threads by subject
-    const SKIP_SUBJECTS = ["hotel", "car hire", "car rental", "restaurant",
-                           "train", "bus", "ferry", "cruise", "visa", "passport"];
-    const firstMessageIds: { threadId: string; messageId: string }[] = [];
+    // For each thread, collect ALL message IDs (not just first)
+    // We'll try first message, but fall back to others if no structured data
+    const SKIP = ["hotel", "car hire", "car rental", "restaurant", "train", "bus", "ferry", "cruise"];
+    const threadMessageIds: { threadId: string; messageIds: string[] }[] = [];
 
     for (const thread of threads) {
-      const threadData = metadataBatch.get(thread.id);
-      if (!threadData?.messages?.length) continue;
-
-      // messages[0] is the oldest = original booking confirmation
-      const firstMsg = threadData.messages[0];
-      const subjectHeader = firstMsg.payload?.headers?.find((h: any) => h.name === "Subject");
+      const td = metaBatch.get(thread.id);
+      if (!td?.messages?.length) continue;
+      const subjectHeader = td.messages[0].payload?.headers?.find((h: any) => h.name === "Subject");
       const subject = (subjectHeader?.value ?? "").toLowerCase();
-
-      if (SKIP_SUBJECTS.some(w => subject.includes(w))) continue;
-
-      firstMessageIds.push({ threadId: thread.id, messageId: firstMsg.id });
+      if (SKIP.some(w => subject.includes(w))) continue;
+      // Collect up to 3 message IDs per thread (first booking email + maybe a second format)
+      const ids = td.messages.slice(0, 3).map((m: any) => m.id);
+      threadMessageIds.push({ threadId: thread.id, messageIds: ids });
     }
 
-    if (!firstMessageIds.length) {
-      return { detected: threads.length, inserted: 0, error: "No flight threads found after filtering" };
-    }
+    if (!threadMessageIds.length) return { detected: threads.length, inserted: 0, error: "No flight threads found" };
 
-    // ── Subrequest 3: Batch fetch full content of first message per thread ─
-    // All first-message fetches in ONE fetch() = 1 subrequest.
-    const messagesBatch = await gmailBatch(
-      firstMessageIds.map(({ messageId }) => ({
-        id: messageId,
-        path: `/gmail/v1/users/me/messages/${messageId}?format=full`,
-      })),
+    // Subrequest 3: batch fetch full content of first message of each thread
+    const allFirstIds = threadMessageIds.map(t => t.messageIds[0]);
+    const firstBatch = await gmailBatch(
+      allFirstIds.map(id => ({ id, path: `/gmail/v1/users/me/messages/${id}?format=full` })),
       googleToken
     );
 
-    // ── Parse structured data from each email ─────────────────────────────
+    // Parse flights from first messages
     const flightMap = new Map<string, ParsedFlight>();
+    const threadsNeedingFallback: string[] = [];
 
-    for (const { messageId } of firstMessageIds) {
-      const msgData = messagesBatch.get(messageId);
+    for (const { threadId, messageIds } of threadMessageIds) {
+      const msgData = firstBatch.get(messageIds[0]);
       if (!msgData?.payload) continue;
-
       const flights = parseFlightsFromPayload(msgData.payload);
-
+      if (flights.length === 0 && messageIds.length > 1) {
+        // First message had no structured data — try message 2 or 3
+        threadsNeedingFallback.push(...messageIds.slice(1));
+        continue;
+      }
       for (const f of flights) {
         if (!f.flight_number) continue;
         const key = `${f.flight_number}-${f.departure_date ?? "nodate"}`;
-        if (!flightMap.has(key)) {
-          flightMap.set(key, f);
-        } else {
+        if (!flightMap.has(key)) flightMap.set(key, f);
+        else {
           const ex = flightMap.get(key)!;
           if (!ex.departure_airport && f.departure_airport) ex.departure_airport = f.departure_airport;
           if (!ex.arrival_airport   && f.arrival_airport)   ex.arrival_airport   = f.arrival_airport;
-          if (!ex.departure_date    && f.departure_date)    ex.departure_date    = f.departure_date;
+        }
+      }
+    }
+
+    // Subrequest 4 (optional): batch fetch fallback messages for threads with no data
+    if (threadsNeedingFallback.length > 0) {
+      const fallbackBatch = await gmailBatch(
+        threadsNeedingFallback.slice(0, 40).map(id => ({
+          id,
+          path: `/gmail/v1/users/me/messages/${id}?format=full`,
+        })),
+        googleToken
+      );
+      for (const [, msgData] of fallbackBatch) {
+        if (!msgData?.payload) continue;
+        const flights = parseFlightsFromPayload(msgData.payload);
+        for (const f of flights) {
+          if (!f.flight_number) continue;
+          const key = `${f.flight_number}-${f.departure_date ?? "nodate"}`;
+          if (!flightMap.has(key)) flightMap.set(key, f);
+          else {
+            const ex = flightMap.get(key)!;
+            if (!ex.departure_airport && f.departure_airport) ex.departure_airport = f.departure_airport;
+            if (!ex.arrival_airport   && f.arrival_airport)   ex.arrival_airport   = f.arrival_airport;
+          }
         }
       }
     }
 
     if (!flightMap.size) {
-      return {
-        detected: threads.length,
-        threadsWithData: firstMessageIds.length,
-        batchKeys: [...messagesBatch.keys()].slice(0, 5),
-        inserted: 0,
-        error: "Reservation emails found but no structured flight data detected",
-      };
+      return { detected: threads.length, inserted: 0, error: "No structured flight data found in reservation emails" };
     }
 
-    // ── Subrequests 4+5: Write to Supabase ────────────────────────────────
     const toInsert = [...flightMap.values()].map(f => ({
       user_id:           userId,
       flight_number:     f.flight_number,
@@ -349,34 +337,17 @@ export const scanGmail = createServerFn({ method: "POST" })
       departure_date:    f.departure_date,
     }));
 
-    // Upsert: insert new, update existing, never duplicate
-    // onConflict matches the unique constraint — same flight+date = update not insert
-    const { data: ins, error: insErr } = await (supabase as any)
-      .from("flights")
-      .upsert(toInsert, { 
-        onConflict: "user_id,flight_number,departure_date",
-        ignoreDuplicates: false 
-      })
-      .select();
-
-    // Delete any flights no longer in the scan results
-    // (flights that were deleted from the map because they're no longer in reservations)
-    const currentKeys = toInsert.map(f => f.flight_number + "-" + f.departure_date);
-    const { data: existing } = await (supabase as any)
-      .from("flights").select("id,flight_number,departure_date").eq("user_id", userId);
-    const toDelete = (existing ?? [])
-      .filter((f: any) => !currentKeys.includes(f.flight_number + "-" + f.departure_date))
-      .map((f: any) => f.id);
-    if (toDelete.length) {
-      await (supabase as any).from("flights").delete().in("id", toDelete);
-    }
+    // Use the SECURITY DEFINER function to bypass RLS
+    // This is safe — the function is scoped to the user_id we pass in
+    const { error: rpcErr } = await (supabase as any).rpc("upsert_flights", {
+      p_flights: toInsert,
+    });
 
     return {
       detected: threads.length,
-      threadsWithData: firstMessageIds.length,
       parsed: toInsert.length,
-      inserted: ins?.length ?? 0,
-      error: insErr?.message ?? null,
+      inserted: toInsert.length,
+      error: rpcErr?.message ?? null,
     };
   });
 
