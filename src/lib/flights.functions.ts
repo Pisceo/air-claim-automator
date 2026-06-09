@@ -104,6 +104,22 @@ const AIRLINE_NAMES: Record<string, string> = {
   SN: "Brussels Airlines", V7: "Volotea", BT: "airBaltic", PC: "Pegasus",
 };
 
+// Strict dictionary of valid global IATA codes.
+const VALID_IATA_CODES = new Set([
+  // Europe
+  "MAD", "AMS", "STN", "LHR", "LGW", "BGY", "IST", "BRU", "CDG", "FRA", "MUC", "BCN", 
+  "FCO", "MXP", "ATH", "LIS", "VIE", "CPH", "OSL", "ARN", "HEL", "DUB", "ZRH", "GVA", 
+  "WAW", "PRG", "BUD", "OTP", "PMI", "AGP", "ALC", "VLC", "SVQ", "BIO", "EDI", "MAN",
+  // Americas
+  "JFK", "IAH", "SAL", "EWR", "ORD", "LAX", "SFO", "MIA", "BOS", "IAD", "YYZ", "YVR", 
+  "MEX", "BOG", "GRU", "EZE", "SCL", "LIM", "PTY", "ATL", "DFW", "DEN", "LAS", "SEA",
+  // Asia / Middle East / Oceania
+  "HKG", "DOH", "DXB", "NRT", "HND", "ICN", "PEK", "PVG", "SIN", "BKK", "KUL", "CGK", 
+  "SYD", "MEL", "AKL", "DEL", "BOM", "AUH", "JED", "RUH",
+  // Africa
+  "JNB", "CPT", "CAI", "CMN", "ADD", "NBO"
+]);
+
 function extractJsonLd(html: string): ParsedFlight[] {
   const results: ParsedFlight[] = [];
   for (const s of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
@@ -206,63 +222,72 @@ function parseMicrodataBlock(block: string): ParsedFlight | null {
   };
 }
 
-// A strict dictionary of valid global IATA codes. Add to this as your user base grows.
-const VALID_IATA_CODES = new Set([
-  // Europe
-  "MAD", "AMS", "STN", "LHR", "LGW", "BGY", "IST", "BRU", "CDG", "FRA", "MUC", "BCN", 
-  "FCO", "MXP", "ATH", "LIS", "VIE", "CPH", "OSL", "ARN", "HEL", "DUB", "ZRH", "GVA", 
-  "WAW", "PRG", "BUD", "OTP", "PMI", "AGP", "ALC", "VLC", "SVQ", "BIO", "EDI", "MAN",
-  // Americas
-  "JFK", "IAH", "SAL", "EWR", "ORD", "LAX", "SFO", "MIA", "BOS", "IAD", "YYZ", "YVR", 
-  "MEX", "BOG", "GRU", "EZE", "SCL", "LIM", "PTY", "ATL", "DFW", "DEN", "LAS", "SEA",
-  // Asia / Middle East / Oceania
-  "HKG", "DOH", "DXB", "NRT", "HND", "ICN", "PEK", "PVG", "SIN", "BKK", "KUL", "CGK", 
-  "SYD", "MEL", "AKL", "DEL", "BOM", "AUH", "JED", "RUH",
-  // Africa
-  "JNB", "CPT", "CAI", "CMN", "ADD", "NBO"
-]);
+// ─── UNIVERSAL PARSER ────────────────────────────────────────────────────────
 
-function parseFlightsFromPayload(payload: any): ParsedFlight[] {
+function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDate: string | null = null): ParsedFlight[] {
   const html = getHtml(payload);
   if (!html) return [];
   
   let flights: ParsedFlight[] = [];
   
   // 1. Try Structured Data first
-  if (html.includes("application/ld+json")) {
-    flights = flights.concat(extractJsonLd(html));
-  }
-  if (html.includes("FlightReservation")) {
-    flights = flights.concat(extractMicrodata(html));
-  }
+  if (html.includes("application/ld+json")) flights = flights.concat(extractJsonLd(html));
+  if (html.includes("FlightReservation")) flights = flights.concat(extractMicrodata(html));
 
-  // 2. SURGICAL PATCH: Fix missing airports using the Strict Dictionary
-  // If structured data found the flight but missed an airport (like Ryanair does)
+  // Strip HTML and convert to uppercase for text scanning
+  let rawText = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+                    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+                    .replace(/<[^>]+>/g, ' ')
+                    .toUpperCase();
+  
+  const combinedText = `${subject.toUpperCase()} ${rawText}`;
+
+  // 2. SURGICAL PATCH: Fix missing data for structured flights (like Ryanair)
   if (flights.length > 0) {
     for (const f of flights) {
       if (!f.arrival_airport || !f.departure_airport) {
-        
-        // Kill CSS/JS, strip HTML, and convert to uppercase
-        let rawText = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
-                          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
-                          .replace(/<[^>]+>/g, ' ')
-                          .toUpperCase();
-
-        // Extract 3-letter words, but ONLY keep them if they exist in our Strict Dictionary
-        const foundAirports = [...rawText.matchAll(/\b([A-Z]{3})\b/g)]
-          .map(m => m[1])
-          .filter(code => VALID_IATA_CODES.has(code));
+        const foundAirports = [...combinedText.matchAll(/\b([A-Z]{3})\b/g)]
+          .map(m => m[1]).filter(code => VALID_IATA_CODES.has(code));
 
         if (foundAirports.length > 0) {
-          // Patch the missing departure airport
           if (!f.departure_airport) f.departure_airport = foundAirports[0];
-          
-          // Patch the missing arrival airport (make sure it's not the same as departure)
           if (!f.arrival_airport && foundAirports.length > 1) {
             f.arrival_airport = foundAirports.find(a => a !== f.departure_airport) || null;
           }
         }
       }
+      if (!f.departure_date && fallbackDate) f.departure_date = fallbackDate;
+    }
+    return flights;
+  }
+
+  // 3. UNIVERSAL FALLBACK: For airlines with NO structured data (KLM, EasyJet, etc.)
+  const validCodes = Object.keys(AIRLINE_NAMES).join('|');
+  const flightRegex = new RegExp(`\\b(${validCodes})\\s*(\\d{2,4})\\b`, 'g');
+  const flightMatches = [...combinedText.matchAll(flightRegex)];
+
+  if (flightMatches.length > 0) {
+    const foundAirports = [...combinedText.matchAll(/\b([A-Z]{3})\b/g)]
+      .map(m => m[1]).filter(code => VALID_IATA_CODES.has(code));
+
+    if (foundAirports.length >= 2) {
+      const uniqueFlights = new Map<string, ParsedFlight>();
+      for (const m of flightMatches) {
+        const iata = m[1];
+        const num = m[2];
+        const flightNumber = `${iata}${num}`;
+
+        if (!uniqueFlights.has(flightNumber)) {
+           uniqueFlights.set(flightNumber, {
+             flight_number: flightNumber,
+             airline: AIRLINE_NAMES[iata] || iata,
+             departure_airport: foundAirports[0],
+             arrival_airport: foundAirports.find(a => a !== foundAirports[0]) || null,
+             departure_date: fallbackDate
+           });
+        }
+      }
+      return Array.from(uniqueFlights.values());
     }
   }
 
@@ -325,29 +350,20 @@ export const scanGmail = createServerFn({ method: "POST" })
 
     const flightMap = new Map<string, ParsedFlight>();
     const threadsNeedingFallback: string[] = [];
-    const rawTextSamples: string[] = []; // Our diagnostic bucket
 
     for (const { threadId, messageIds } of threadMessageIds) {
       const msgData = firstBatch.get(messageIds[0]);
       if (!msgData?.payload) continue;
       
-      const html = getHtml(msgData.payload);
       const td = metaBatch.get(threadId);
-      
-      // Grab BOTH the Subject and the From headers
       const subject = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "Subject")?.value ?? "?";
-      const fromAddress = td?.messages?.[0]?.payload?.headers?.find((h: any) => h.name === "From")?.value ?? "?";
-      
-      // Check if the SENDER is KLM, or the SUBJECT is Ryanair
-      if (fromAddress.toLowerCase().includes("klm") || subject.toLowerCase().includes("ryanair")) {
-         let rawText = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
-                           .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
-                           .replace(/<[^>]+>/g, ' ')
-                           .toUpperCase();
-         rawTextSamples.push(`[FROM: ${fromAddress}] [SUBJ: ${subject}] -> \n${rawText.substring(0, 1500)}`);
+      let fallbackDate: string | null = null;
+      if (msgData.internalDate) {
+        fallbackDate = new Date(parseInt(msgData.internalDate)).toISOString().split("T")[0];
       }
-
-      const flights = parseFlightsFromPayload(msgData.payload);
+      
+      // Feed the universal parser everything it needs
+      const flights = parseFlightsFromPayload(msgData.payload, subject, fallbackDate);
       
       if (flights.length === 0 && messageIds.length > 1) {
         threadsNeedingFallback.push(...messageIds.slice(1));
@@ -380,8 +396,7 @@ export const scanGmail = createServerFn({ method: "POST" })
 
     const debugData = {
       threadsWithNoStructuredData: threadsNeedingFallback.length,
-      flightMapKeys: [...flightMap.keys()],
-      rawTextSamples // Hand the bucket to the frontend
+      flightMapKeys: [...flightMap.keys()]
     };
 
     if (!flightMap.size) {
