@@ -15,9 +15,9 @@ const AIRLINE_MAP: Record<string, string> = {
 
 const AIRLINE_DOMAINS = [
   "ryanair.com", "easyjet.com", "wizzair.com", "vueling.com",
-  "klm.com", "airfrance.com", "lufthansa.com", "iberia.com",
+  "klm.com", "klm-info.com", "airfrance.com", "lufthansa.com", "iberia.com",
   "britishairways.com", "transavia.com", "norwegian.com", "tap.pt",
-  "turkishairlines.com", "emirates.com", "aireuropa.com",
+  "turkishairlines.com", "thy.com", "emirates.com", "aireuropa.com",
   "united.com", "delta.com", "aa.com", "qatarairways.com",
   "etihad.com", "flysas.com", "finnair.com", "lot.com", "swiss.com",
   "austrian.com", "brusselsairlines.com", "airbaltic.com",
@@ -68,7 +68,7 @@ const CITY_IATA: Record<string, string> = {
   "delhi": "DEL", "mumbai": "BOM", "sydney": "SYD", "melbourne": "MEL",
 };
 
-// ─── HELPERS ─────────────────────────────────────────────────────────────────
+// ─── DECODE ──────────────────────────────────────────────────────────────────
 
 function base64Decode(str: string): string {
   try {
@@ -81,54 +81,44 @@ function base64Decode(str: string): string {
   }
 }
 
-function extractBodyText(payload: any, depth = 0): string {
+function getHtmlParts(payload: any, depth = 0): string[] {
+  if (depth > 4) return [];
+  const parts: string[] = [];
+  if (payload?.mimeType === "text/html" && payload?.body?.data) {
+    try { parts.push(base64Decode(payload.body.data)); } catch { /* skip */ }
+  }
+  if (payload?.parts) {
+    for (const p of payload.parts) {
+      if (p.mimeType === "text/html" && p.body?.data) {
+        try { parts.push(base64Decode(p.body.data)); } catch { /* skip */ }
+      } else if (p.mimeType?.startsWith("multipart/")) {
+        parts.push(...getHtmlParts(p, depth + 1));
+      }
+    }
+  }
+  return parts;
+}
+
+function getPlainText(payload: any, depth = 0): string {
   if (depth > 4) return "";
   let text = "";
   if (payload?.body?.data) {
     try { text += base64Decode(payload.body.data); } catch { /* skip */ }
   }
   if (payload?.parts) {
-    for (const part of payload.parts) {
-      if (part.mimeType === "text/plain" && part.body?.data) {
-        try { text += base64Decode(part.body.data) + "\n"; } catch { /* skip */ }
-      } else if (part.mimeType?.startsWith("multipart/")) {
-        text += extractBodyText(part, depth + 1);
-      }
-    }
-    if (!text.trim()) {
-      for (const part of payload.parts) {
-        if (part.mimeType === "text/html" && part.body?.data) {
-          try {
-            text += base64Decode(part.body.data).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
-          } catch { /* skip */ }
-        }
+    for (const p of payload.parts) {
+      if (p.mimeType === "text/plain" && p.body?.data) {
+        try { text += base64Decode(p.body.data) + "\n"; } catch { /* skip */ }
+      } else if (p.mimeType?.startsWith("multipart/")) {
+        text += getPlainText(p, depth + 1);
       }
     }
   }
   return text;
 }
 
-function extractHtmlParts(payload: any, depth = 0): string[] {
-  if (depth > 4) return [];
-  const htmlParts: string[] = [];
-  if (payload?.body?.data && payload?.mimeType === "text/html") {
-    try { htmlParts.push(base64Decode(payload.body.data)); } catch { /* skip */ }
-  }
-  if (payload?.parts) {
-    for (const part of payload.parts) {
-      if (part.mimeType === "text/html" && part.body?.data) {
-        try { htmlParts.push(base64Decode(part.body.data)); } catch { /* skip */ }
-      } else if (part.mimeType?.startsWith("multipart/")) {
-        htmlParts.push(...extractHtmlParts(part, depth + 1));
-      }
-    }
-  }
-  return htmlParts;
-}
-
-// ─── STRUCTURED DATA EXTRACTION (JSON-LD / Schema.org) ───────────────────────
-// This reads the Google flight widgets embedded in airline emails
-// Returns array of flights (one email can have multiple e.g. layovers, round trips)
+// ─── STRATEGY 1: HTML MICRODATA (itemprop) ────────────────────────────────────
+// Used by: Iberia, United, Turkish Airlines, British Airways
 
 interface ParsedFlight {
   flightNumber: string;
@@ -136,130 +126,164 @@ interface ParsedFlight {
   dep: string | null;
   arr: string | null;
   date: string | null;
-  confirmationCode?: string;
 }
 
-function extractFromJsonLd(htmlParts: string[]): ParsedFlight[] {
+function extractFromMicrodata(html: string): ParsedFlight[] {
   const flights: ParsedFlight[] = [];
 
-  for (const html of htmlParts) {
-    // Find all <script type="application/ld+json"> blocks
-    const scriptMatches = html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi);
-    for (const match of scriptMatches) {
-      try {
-        const json = JSON.parse(match[1].trim());
-        const items = Array.isArray(json) ? json : [json];
+  // Find all FlightReservation blocks
+  const reservationBlocks = html.matchAll(
+    /itemtype=["'][^"']*FlightReservation["'][^>]*>([\s\S]*?)(?=itemtype=["'][^"']*FlightReservation["']|$)/gi
+  );
 
-        for (const item of items) {
-          // Handle @graph arrays (some airlines wrap in @graph)
-          const nodes = item["@graph"] ? item["@graph"] : [item];
+  for (const block of reservationBlocks) {
+    const content = block[1];
+    const flight = parseItempropBlock(content);
+    if (flight) flights.push(flight);
+  }
 
-          for (const node of nodes) {
-            const reservations = Array.isArray(node) ? node : [node];
-            for (const res of reservations) {
-              const parsed = parseReservationNode(res);
-              if (parsed) flights.push(parsed);
-            }
-          }
-        }
-      } catch { /* invalid JSON, skip */ }
-    }
+  // Fallback: try whole HTML if no blocks found
+  if (flights.length === 0) {
+    const flight = parseItempropBlock(html);
+    if (flight) flights.push(flight);
   }
 
   return flights;
 }
 
-function parseReservationNode(node: any): ParsedFlight | null {
-  if (!node || typeof node !== "object") return null;
-
-  // Support FlightReservation, ReservationPackage, or direct Flight objects
-  const type = node["@type"] ?? "";
-  const reservationFor = node.reservationFor ?? node;
-
-  // Handle arrays of reservations (round trips)
-  if (Array.isArray(node.reservationFor)) {
-    // Return first leg only — each will be processed separately
-    return parseReservationNode({ ...node, reservationFor: node.reservationFor[0] });
+function parseItempropBlock(html: string): ParsedFlight | null {
+  // Extract itemprop meta values
+  function getMeta(prop: string): string {
+    const m = html.match(new RegExp(`itemprop=["']${prop}["'][^>]*content=["']([^"']+)["']`, "i"))
+      || html.match(new RegExp(`content=["']([^"']+)["'][^>]*itemprop=["']${prop}["']`, "i"));
+    return m ? m[1].trim() : "";
   }
 
-  const flight = type === "Flight" ? node : reservationFor;
-  if (!flight) return null;
+  // Get all iataCode values in order: airline, departureAirport, arrivalAirport
+  const iataCodes = [...html.matchAll(/itemprop=["']iataCode["'][^>]*content=["']([^"']+)["']/gi)]
+    .map(m => m[1].trim().toUpperCase());
 
-  // Extract flight number
-  const rawNum = flight.flightNumber ?? flight.flight_number ?? "";
-  const airlineObj = flight.airline ?? flight.operatingAirline ?? {};
-  const iataCode = airlineObj.iataCode ?? airlineObj.iata_code ?? "";
+  if (iataCodes.length === 0) return null;
 
-  if (!rawNum && !iataCode) return null;
+  // First iataCode is airline, second is departure airport, third is arrival airport
+  const airlineCode = iataCodes[0];
+  const dep = iataCodes[1] && ALL_AIRPORTS.has(iataCodes[1]) ? iataCodes[1] : null;
+  const arr = iataCodes[2] && ALL_AIRPORTS.has(iataCodes[2]) ? iataCodes[2] : null;
 
-  const flightNumber = iataCode && rawNum
-    ? `${iataCode}${rawNum}`
-    : (rawNum || "").toString();
+  if (!AIRLINE_MAP[airlineCode]) return null;
 
-  if (!flightNumber || !AIRLINE_MAP[flightNumber.slice(0, 2)]) return null;
+  const rawFlightNum = getMeta("flightNumber");
+  if (!rawFlightNum) return null;
 
-  // Extract airports
-  const depObj = flight.departureAirport ?? flight.departure_airport ?? {};
-  const arrObj = flight.arrivalAirport ?? flight.arrival_airport ?? {};
-  const dep = depObj.iataCode ?? depObj.iata_code ?? null;
-  const arr = arrObj.iataCode ?? arrObj.iata_code ?? null;
+  const flightNumber = `${airlineCode}${rawFlightNum.padStart(4, "0")}`;
 
-  // Extract date from departureTime
-  const depTime = flight.departureTime ?? flight.departure_time ?? "";
+  const depTime = getMeta("departureTime");
   let date: string | null = null;
   if (depTime) {
     const d = new Date(depTime);
-    if (!isNaN(d.getTime())) {
-      date = d.toISOString().split("T")[0];
-    }
+    if (!isNaN(d.getTime())) date = d.toISOString().split("T")[0];
   }
 
-  // Confirmation / booking reference
-  const confirmationCode = node.reservationNumber ?? node.reservationId ?? node.bookingReference ?? undefined;
-
-  const airlineName = AIRLINE_MAP[flightNumber.slice(0, 2)] ?? iataCode;
-
   return {
-    flightNumber: flightNumber.toUpperCase(),
-    airline: airlineName,
-    dep: dep ? dep.toUpperCase() : null,
-    arr: arr ? arr.toUpperCase() : null,
+    flightNumber,
+    airline: AIRLINE_MAP[airlineCode],
+    dep,
+    arr,
     date,
-    confirmationCode,
   };
 }
 
-// ─── FALLBACK: regex-based extraction ────────────────────────────────────────
+// ─── STRATEGY 2: JSON-LD ─────────────────────────────────────────────────────
+// Some airlines do use JSON-LD, keep as backup
 
-function extractFlightNumbers(text: string): string[] {
-  const results: string[] = [];
-  const seen = new Set<string>();
-  for (const m of text.matchAll(/\b([A-Z]{2})(\d{3,4})\b/g)) {
-    const full = m[1] + m[2];
-    if (AIRLINE_MAP[m[1]] && !seen.has(full)) { seen.add(full); results.push(full); }
+function extractFromJsonLd(html: string): ParsedFlight[] {
+  const flights: ParsedFlight[] = [];
+  for (const match of html.matchAll(/<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const json = JSON.parse(match[1].trim());
+      const items = Array.isArray(json) ? json : [json];
+      for (const item of items) {
+        const nodes = item["@graph"] ? item["@graph"] : [item];
+        for (const node of nodes) {
+          const f = parseJsonLdNode(node);
+          if (f) flights.push(f);
+        }
+      }
+    } catch { /* skip */ }
   }
-  return results;
+  return flights;
 }
 
-function extractRoute(text: string): { dep: string | null; arr: string | null } {
-  for (const re of [
-    /\b([A-Z]{3})\s*(?:→|->|➜|⟶)\s*([A-Z]{3})\b/g,
-    /\b([A-Z]{3})\s*[-–—]\s*([A-Z]{3})\b/g,
-  ]) {
-    const m = re.exec(text);
-    if (m && ALL_AIRPORTS.has(m[1]) && ALL_AIRPORTS.has(m[2]) && m[1] !== m[2]) {
-      return { dep: m[1], arr: m[2] };
-    }
+function parseJsonLdNode(node: any): ParsedFlight | null {
+  if (!node || typeof node !== "object") return null;
+  const reservationFor = node.reservationFor ?? node;
+  const flight = node["@type"] === "Flight" ? node : reservationFor;
+  if (!flight) return null;
+
+  const rawNum = flight.flightNumber ?? "";
+  const airlineObj = flight.airline ?? flight.operatingAirline ?? {};
+  const iataCode = (airlineObj.iataCode ?? "").toUpperCase();
+  if (!rawNum || !iataCode || !AIRLINE_MAP[iataCode]) return null;
+
+  const flightNumber = `${iataCode}${String(rawNum).padStart(4, "0")}`;
+  const dep = (flight.departureAirport?.iataCode ?? "").toUpperCase() || null;
+  const arr = (flight.arrivalAirport?.iataCode ?? "").toUpperCase() || null;
+
+  let date: string | null = null;
+  const depTime = flight.departureTime ?? "";
+  if (depTime) {
+    const d = new Date(depTime);
+    if (!isNaN(d.getTime())) date = d.toISOString().split("T")[0];
   }
-  const cityArrow = /\b([A-Za-z][a-z]+(?: [A-Za-z][a-z]+)*)\s*(?:→|->|to)\s*([A-Za-z][a-z]+(?: [A-Za-z][a-z]+)*)/gi;
-  for (const m of text.matchAll(cityArrow)) {
-    const dep = CITY_IATA[m[1].toLowerCase().trim()];
-    const arr = CITY_IATA[m[2].toLowerCase().trim()];
-    if (dep && arr && dep !== arr) return { dep, arr };
+
+  return {
+    flightNumber,
+    airline: AIRLINE_MAP[iataCode],
+    dep: dep && ALL_AIRPORTS.has(dep) ? dep : null,
+    arr: arr && ALL_AIRPORTS.has(arr) ? arr : null,
+    date,
+  };
+}
+
+// ─── STRATEGY 3: REGEX FALLBACK ──────────────────────────────────────────────
+// For KLM check-in emails which have no structured data at all
+
+function extractFromRegex(text: string, from: string): ParsedFlight | null {
+  // Extract flight number
+  const fnMatch = text.match(/\b([A-Z]{2})(\d{3,4})\b/);
+  if (!fnMatch || !AIRLINE_MAP[fnMatch[1]]) return null;
+  const flightNumber = fnMatch[1] + fnMatch[2];
+  const airlineCode = fnMatch[1];
+
+  // Extract route — look for "City (IATA)" pattern first (KLM uses this)
+  const cityIataPattern = /([A-Z][a-zA-Z\s]+)\s*\(([A-Z]{3})\)/g;
+  const routeCodes: string[] = [];
+  for (const m of text.matchAll(cityIataPattern)) {
+    const code = m[2].toUpperCase();
+    if (ALL_AIRPORTS.has(code)) routeCodes.push(code);
   }
-  const codes = [...text.matchAll(/\b([A-Z]{3})\b/g)].map(m => m[1]).filter(c => ALL_AIRPORTS.has(c));
-  const unique = [...new Set(codes)];
-  return unique.length >= 2 ? { dep: unique[0], arr: unique[1] } : { dep: null, arr: null };
+
+  let dep: string | null = routeCodes[0] ?? null;
+  let arr: string | null = routeCodes[1] ?? null;
+
+  // If no city(IATA) pattern, try bare IATA codes
+  if (!dep || !arr) {
+    const codes = [...text.matchAll(/\b([A-Z]{3})\b/g)]
+      .map(m => m[1])
+      .filter(c => ALL_AIRPORTS.has(c));
+    const unique = [...new Set(codes)];
+    dep = dep ?? unique[0] ?? null;
+    arr = arr ?? unique[1] ?? null;
+  }
+
+  // Extract date
+  const date = extractDate(text);
+
+  const airline = guessAirlineFromSender(from) || AIRLINE_MAP[airlineCode] || airlineCode;
+
+  if (!date) return null;
+
+  return { flightNumber, airline, dep, arr, date };
 }
 
 function extractDate(text: string): string | null {
@@ -274,6 +298,9 @@ function extractDate(text: string): string | null {
   const p2 = /\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})[,\s]+(20\d{2})\b/gi;
   const p3 = /\b(20\d{2})-(\d{2})-(\d{2})\b/g;
   const p4 = /\b(\d{2})\/(\d{2})\/(20\d{2})\b/g;
+  // KLM specific: "Thu 28 May 26" (short year)
+  const p5 = /\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2})\b/gi;
+
   let m;
   while ((m = p1.exec(text))) {
     const y = m[3], mo = MONTHS[m[2].toLowerCase().slice(0,3)] || "01", d = m[1].padStart(2,"0");
@@ -289,13 +316,21 @@ function extractDate(text: string): string | null {
   while ((m = p4.exec(text))) {
     if (parseInt(m[3]) >= 2020 && parseInt(m[3]) <= 2027) candidates.push(`${m[3]}-${m[2]}-${m[1]}`);
   }
+  while ((m = p5.exec(text))) {
+    // "Thu 28 May 26" → 2026-05-28
+    const day = m[1].padStart(2,"0");
+    const mo = MONTHS[m[2].toLowerCase()] || "01";
+    const yr = parseInt(m[3]) >= 50 ? `19${m[3]}` : `20${m[3]}`;
+    if (parseInt(yr) >= 2020 && parseInt(yr) <= 2027) candidates.push(`${yr}-${mo}-${day}`);
+  }
+
   const valid = candidates.filter(d => !isNaN(new Date(d).getTime()));
   if (valid.length === 0) return null;
   valid.sort();
   return valid[0];
 }
 
-function guessAirline(from: string): string | null {
+function guessAirlineFromSender(from: string): string | null {
   const f = from.toLowerCase();
   if (f.includes("klm")) return "KLM";
   if (f.includes("ryanair")) return "Ryanair";
@@ -350,10 +385,9 @@ export const scanGmail = createServerFn({ method: "POST" })
     // Clear old flights
     await (supabase as any).from("flights").delete().eq("user_id", userId);
 
-    // flightMap key = "FLIGHTNUM-DATE" — deduplicates across multiple emails for same flight
+    // flightMap key = "FLIGHTNUM-DATE" — no duplicates
     const flightMap = new Map<string, any>();
 
-    // Up to 35 subrequests for full email content — total stays under 50
     for (const msg of messages) {
       try {
         const res = await fetch(
@@ -368,76 +402,63 @@ export const scanGmail = createServerFn({ method: "POST" })
         const from    = hdrs.find((h: any) => h.name === "From")?.value ?? "";
         const dateHdr = hdrs.find((h: any) => h.name === "Date")?.value ?? "";
 
-        // Skip clearly non-booking emails
+        // Skip noise emails
         const subj = subject.toLowerCase();
         if (["survey","newsletter","unsubscribe","miles earned","points earned",
              "feedback","satisfaction"].some(w => subj.includes(w))) continue;
 
-        // ── Strategy 1: extract JSON-LD structured data (most reliable) ──
-        const htmlParts = extractHtmlParts(full.payload);
-        const structuredFlights = extractFromJsonLd(htmlParts);
+        const htmlParts = getHtmlParts(full.payload);
+        const fullHtml  = htmlParts.join("\n");
+        const plainText = getPlainText(full.payload);
+        const allText   = subject + "\n" + plainText + "\n" + fullHtml.replace(/<[^>]+>/g, " ");
 
-        if (structuredFlights.length > 0) {
-          // We got clean structured data — use it directly
-          for (const sf of structuredFlights) {
-            if (!sf.date) {
-              // Fall back to email date if JSON-LD missing date
-              const ed = new Date(dateHdr);
-              if (!isNaN(ed.getTime())) sf.date = ed.toISOString().split("T")[0];
-            }
-            if (!sf.date) continue;
+        let parsedFlights: ParsedFlight[] = [];
 
-            const key = `${sf.flightNumber}-${sf.date}`;
-            if (!flightMap.has(key)) {
-              flightMap.set(key, {
-                user_id: userId,
-                airline: sf.airline,
-                flight_number: sf.flightNumber,
-                departure_airport: sf.dep,
-                arrival_airport: sf.arr,
-                departure_date: sf.date,
-                raw_email_snippet: (full.snippet ?? "").slice(0, 200),
-              });
-            } else {
-              // Enrich missing fields
-              const ex = flightMap.get(key);
-              if (!ex.departure_airport && sf.dep) ex.departure_airport = sf.dep;
-              if (!ex.arrival_airport && sf.arr) ex.arrival_airport = sf.arr;
-            }
+        // Strategy 1: microdata (Iberia, United, Turkish)
+        if (fullHtml.includes("itemprop") && fullHtml.includes("FlightReservation")) {
+          parsedFlights = extractFromMicrodata(fullHtml);
+        }
+
+        // Strategy 2: JSON-LD
+        if (parsedFlights.length === 0 && fullHtml.includes("application/ld+json")) {
+          for (const html of htmlParts) {
+            parsedFlights.push(...extractFromJsonLd(html));
           }
-          continue; // Don't also do regex for this email
         }
 
-        // ── Strategy 2: regex fallback for emails without JSON-LD ──
-        const body = extractBodyText(full.payload);
-        const all  = subject + "\n" + body;
-
-        const fns = extractFlightNumbers(all);
-        if (fns.length === 0) continue;
-
-        const { dep, arr } = extractRoute(all);
-        let flightDate = extractDate(all);
-        if (!flightDate) {
-          const ed = new Date(dateHdr);
-          if (!isNaN(ed.getTime())) flightDate = ed.toISOString().split("T")[0];
+        // Strategy 3: regex fallback (KLM check-in emails, others)
+        if (parsedFlights.length === 0) {
+          const f = extractFromRegex(allText, from);
+          if (f) parsedFlights.push(f);
         }
-        if (!flightDate) continue;
 
-        const airline = guessAirline(from) || AIRLINE_MAP[fns[0].slice(0,2)] || fns[0].slice(0,2);
-        const fn  = fns[0];
-        const key = `${fn}-${flightDate}`;
+        // Fix missing dates using email header date as fallback
+        for (const pf of parsedFlights) {
+          if (!pf.date) {
+            const ed = new Date(dateHdr);
+            if (!isNaN(ed.getTime())) pf.date = ed.toISOString().split("T")[0];
+          }
+        }
 
-        if (!flightMap.has(key)) {
-          flightMap.set(key, {
-            user_id: userId, airline, flight_number: fn,
-            departure_airport: dep, arrival_airport: arr,
-            departure_date: flightDate,
-            raw_email_snippet: (full.snippet ?? "").slice(0, 200),
-          });
-        } else {
-          const ex = flightMap.get(key);
-          if (!ex.departure_airport && dep) ex.departure_airport = dep;
-          if (!ex.arrival_airport && arr) ex.arrival_airport = arr;
+        // Add to map — dedup by FLIGHTNUM-DATE
+        for (const pf of parsedFlights) {
+          if (!pf.date || !pf.flightNumber) continue;
+          const key = `${pf.flightNumber}-${pf.date}`;
+          if (!flightMap.has(key)) {
+            flightMap.set(key, {
+              user_id: userId,
+              airline: pf.airline,
+              flight_number: pf.flightNumber,
+              departure_airport: pf.dep,
+              arrival_airport: pf.arr,
+              departure_date: pf.date,
+              raw_email_snippet: (full.snippet ?? "").slice(0, 200),
+            });
+          } else {
+            const ex = flightMap.get(key);
+            if (!ex.departure_airport && pf.dep) ex.departure_airport = pf.dep;
+            if (!ex.arrival_airport && pf.arr) ex.arrival_airport = pf.arr;
+          }
         }
       } catch { continue; }
     }
@@ -450,7 +471,6 @@ export const scanGmail = createServerFn({ method: "POST" })
 
     let actuallyInserted = 0;
     let insertError = null;
-
     if (toInsert.length > 0) {
       const { data: ins, error: insErr } = await (supabase as any)
         .from("flights").insert(toInsert).select();
