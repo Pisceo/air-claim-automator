@@ -411,12 +411,28 @@ export const scanGmail = createServerFn({ method: "POST" })
       return true;
     });
 
+   let actuallyInserted = 0;
+    let insertError = null;
+
     if (toInsert.length > 0) {
-      const { error: insertErr } = await (supabase as any).from("flights").insert(toInsert);
-      if (insertErr) console.error("Insert error:", insertErr);
+      const { data: insertData, error: insertErr } = await (supabase as any)
+        .from("flights")
+        .insert(toInsert)
+        .select();
+      if (insertErr) {
+        insertError = insertErr.message;
+        console.error("Insert error:", insertErr);
+      } else {
+        actuallyInserted = insertData?.length ?? 0;
+      }
     }
 
-    return { detected: messages.length, inserted: toInsert.length };
+    return {
+      detected: messages.length,
+      inserted: actuallyInserted,
+      parsed: toInsert.length,
+      error: insertError,
+    };
   });
 
 export const clearAndRescan = createServerFn({ method: "POST" })
