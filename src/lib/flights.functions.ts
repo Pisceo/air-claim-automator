@@ -310,7 +310,7 @@ export const scanGmail = createServerFn({ method: "POST" })
 
     // Subrequest 1: list threads
     const threadsRes = await fetch(
-      `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=100`,
+      `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=35`,
       { headers: { Authorization: `Bearer ${googleToken}` } }
     );
     if (!threadsRes.ok) {
