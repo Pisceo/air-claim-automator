@@ -140,11 +140,12 @@ const VALID_IATA_CODES = new Set([
   // Americas
   "JFK", "IAH", "SAL", "EWR", "ORD", "LAX", "SFO", "MIA", "BOS", "IAD", "YYZ", "YVR", 
   "MEX", "BOG", "GRU", "EZE", "SCL", "LIM", "PTY", "ATL", "DFW", "DEN", "SEA", "MSY",
+  "LAS", 
   // Asia / Middle East / Oceania
   "HKG", "DOH", "DXB", "NRT", "HND", "ICN", "PEK", "PVG", "SIN", "BKK", "KUL", "CGK", 
   "SYD", "MEL", "AKL", "DEL", "BOM", "AUH", "JED", "RUH",
   // Africa
-  "JNB", "CPT", "CAI", "CMN", "ADD", "NBO"
+  "JNB", "CPT", "CAI", "CMN", "ADD", "NBO", "LOS"
 ]);
 
 function extractJsonLd(html: string): ParsedFlight[] {
@@ -257,23 +258,21 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
   
   let flights: ParsedFlight[] = [];
   
-  // 1. Try Structured Data first
   if (html.includes("application/ld+json")) flights = flights.concat(extractJsonLd(html));
   if (html.includes("FlightReservation")) flights = flights.concat(extractMicrodata(html));
 
-  // Strip HTML and convert to uppercase for text scanning
-  let rawText = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
-                    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
-                    .replace(/<[^>]+>/g, ' ')
-                    .toUpperCase();
+  // STRIP HTML BUT KEEP ORIGINAL CASING
+  let rawTextOriginal = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
+                            .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
+                            .replace(/<[^>]+>/g, ' ');
   
-  const combinedText = `${subject.toUpperCase()} ${rawText}`;
+  const combinedText = `${subject} ${rawTextOriginal}`;
   const defaultYear = fallbackDate ? fallbackDate.substring(0, 4) : new Date().getFullYear().toString();
 
-  // 2. SURGICAL PATCH: Fix missing data for structured flights (like Ryanair)
   if (flights.length > 0) {
     for (const f of flights) {
       if (!f.arrival_airport || !f.departure_airport) {
+        // ONLY match strictly uppercase 3-letter words. Ignores "las", catches "LAS".
         const foundAirports = [...combinedText.matchAll(/\b([A-Z]{3})\b/g)]
           .map(m => m[1]).filter(code => VALID_IATA_CODES.has(code));
 
@@ -284,14 +283,50 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
           }
         }
       }
-      // Only assign a fallback date if we found a REAL date in the text. 
-      // Do not use the email sent date, it creates ghost flights.
-      if (!f.departure_date) {
-        f.departure_date = extractDateFromText(combinedText, defaultYear);
-      }
+      if (!f.departure_date) f.departure_date = extractDateFromText(combinedText.toUpperCase(), defaultYear);
     }
     return flights;
   }
+
+  const validCodes = Object.keys(AIRLINE_NAMES).join('|');
+  // Make the flight regex case-insensitive to catch "kl 1500" or "KL 1500"
+  const flightRegex = new RegExp(`\\b(${validCodes})\\s*(\\d{2,4})\\b`, 'gi');
+  const flightMatches = [...combinedText.matchAll(flightRegex)];
+
+  if (flightMatches.length > 0) {
+    const uniqueFlights = new Map<string, ParsedFlight>();
+    
+    for (const m of flightMatches) {
+      const chunk = combinedText.substring(Math.max(0, m.index! - 150), Math.min(combinedText.length, m.index! + 150));
+      
+      // Strict uppercase match for local airports
+      const localAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
+        .map(a => a[1]).filter(code => VALID_IATA_CODES.has(code));
+
+      let flightDate = extractDateFromText(chunk.toUpperCase(), defaultYear);
+      if (!flightDate) flightDate = extractDateFromText(combinedText.toUpperCase(), defaultYear);
+
+      if (localAirports.length >= 2 && flightDate) {
+        const iata = m[1].toUpperCase();
+        const num = m[2];
+        const flightNumber = `${iata}${num}`;
+
+        if (!uniqueFlights.has(flightNumber)) {
+           uniqueFlights.set(flightNumber, {
+             flight_number: flightNumber,
+             airline: AIRLINE_NAMES[iata] || iata,
+             departure_airport: localAirports[0],
+             arrival_airport: localAirports.find(a => a !== localAirports[0]) || null,
+             departure_date: flightDate
+           });
+        }
+      }
+    }
+    return Array.from(uniqueFlights.values());
+  }
+
+  return flights;
+}
 
   // 3. UNIVERSAL FALLBACK: For airlines with NO structured data (KLM, EasyJet, etc.)
   const validCodes = Object.keys(AIRLINE_NAMES).join('|');
