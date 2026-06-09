@@ -41,34 +41,29 @@ function normalizeFlightNumber(fn: string): string {
   return clean;
 }
 
-// Scans text for actual flight dates (e.g. "28 May", "16/03/2026", "2024-01-03")
 function extractDateFromText(text: string, defaultYear: string): string | null {
-  // 1. YYYY-MM-DD or YYYY/MM/DD
   let m = text.match(/\b(202[3-9])[-/](1[0-2]|0?[1-9])[-/](3[01]|[12]\d|0?[1-9])\b/);
   if (m) return `${m[1]}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`;
 
-  // 2. DD/MM/YYYY or DD-MM-YYYY
   m = text.match(/\b(3[01]|[12]\d|0?[1-9])[-/](1[0-2]|0?[1-9])[-/](202[3-9])\b/);
   if (m) return `${m[3]}-${m[2].padStart(2,'0')}-${m[1].padStart(2,'0')}`;
 
-  // 3. DD MMM YYYY or DD MMM (e.g., 28 MAY)
   const months = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
   const monthRegex = months.join("|");
-  const ddmmyyyy = new RegExp(`\\b(3[01]|[12]\\d|0?[1-9])\\s+(${monthRegex})[A-Z]*\\s*(202[3-9])?\\b`);
+  const ddmmyyyy = new RegExp(`\\b(3[01]|[12]\\d|0?[1-9])\\s+(${monthRegex})[A-Z]*\\s*(202[3-9])?\\b`, 'i');
   m = text.match(ddmmyyyy);
   if (m) {
     const day = m[1].padStart(2, '0');
-    const monthIdx = months.indexOf(m[2]) + 1;
+    const monthIdx = months.indexOf(m[2].toUpperCase()) + 1;
     const month = monthIdx.toString().padStart(2, '0');
     const year = m[3] || defaultYear;
     return `${year}-${month}-${day}`;
   }
 
-  // 4. MMM DD YYYY or MMM DD (e.g., MAY 28)
-  const mmddyyyy = new RegExp(`\\b(${monthRegex})[A-Z]*\\s+(3[01]|[12]\\d|0?[1-9])(?:ST|ND|RD|TH)?\\s*,?\\s*(202[3-9])?\\b`);
+  const mmddyyyy = new RegExp(`\\b(${monthRegex})[A-Z]*\\s+(3[01]|[12]\\d|0?[1-9])(?:ST|ND|RD|TH)?\\s*,?\\s*(202[3-9])?\\b`, 'i');
   m = text.match(mmddyyyy);
   if (m) {
-    const monthIdx = months.indexOf(m[1]) + 1;
+    const monthIdx = months.indexOf(m[1].toUpperCase()) + 1;
     const month = monthIdx.toString().padStart(2, '0');
     const day = m[2].padStart(2, '0');
     const year = m[3] || defaultYear;
@@ -131,21 +126,15 @@ const AIRLINE_NAMES: Record<string, string> = {
   SN: "Brussels Airlines", V7: "Volotea", BT: "airBaltic", PC: "Pegasus",
 };
 
-// Removed "LAS" and "LOS" to prevent Spanish language collisions
 const VALID_IATA_CODES = new Set([
-  // Europe
   "MAD", "AMS", "STN", "LHR", "LGW", "BGY", "IST", "BRU", "CDG", "FRA", "MUC", "BCN", 
   "FCO", "MXP", "ATH", "LIS", "VIE", "CPH", "OSL", "ARN", "HEL", "DUB", "ZRH", "GVA", 
   "WAW", "PRG", "BUD", "OTP", "PMI", "AGP", "ALC", "VLC", "SVQ", "BIO", "EDI", "MAN",
-  // Americas
   "JFK", "IAH", "SAL", "EWR", "ORD", "LAX", "SFO", "MIA", "BOS", "IAD", "YYZ", "YVR", 
   "MEX", "BOG", "GRU", "EZE", "SCL", "LIM", "PTY", "ATL", "DFW", "DEN", "SEA", "MSY",
-  "LAS", 
-  // Asia / Middle East / Oceania
   "HKG", "DOH", "DXB", "NRT", "HND", "ICN", "PEK", "PVG", "SIN", "BKK", "KUL", "CGK", 
   "SYD", "MEL", "AKL", "DEL", "BOM", "AUH", "JED", "RUH",
-  // Africa
-  "JNB", "CPT", "CAI", "CMN", "ADD", "NBO", "LOS"
+  "JNB", "CPT", "CAI", "CMN", "ADD", "NBO"
 ]);
 
 function extractJsonLd(html: string): ParsedFlight[] {
@@ -261,7 +250,6 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
   if (html.includes("application/ld+json")) flights = flights.concat(extractJsonLd(html));
   if (html.includes("FlightReservation")) flights = flights.concat(extractMicrodata(html));
 
-  // STRIP HTML BUT KEEP ORIGINAL CASING
   let rawTextOriginal = html.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, ' ')
                             .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, ' ')
                             .replace(/<[^>]+>/g, ' ');
@@ -272,7 +260,6 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
   if (flights.length > 0) {
     for (const f of flights) {
       if (!f.arrival_airport || !f.departure_airport) {
-        // ONLY match strictly uppercase 3-letter words. Ignores "las", catches "LAS".
         const foundAirports = [...combinedText.matchAll(/\b([A-Z]{3})\b/g)]
           .map(m => m[1]).filter(code => VALID_IATA_CODES.has(code));
 
@@ -283,13 +270,14 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
           }
         }
       }
-      if (!f.departure_date) f.departure_date = extractDateFromText(combinedText.toUpperCase(), defaultYear);
+      if (!f.departure_date) {
+        f.departure_date = extractDateFromText(combinedText.toUpperCase(), defaultYear);
+      }
     }
     return flights;
   }
 
   const validCodes = Object.keys(AIRLINE_NAMES).join('|');
-  // Make the flight regex case-insensitive to catch "kl 1500" or "KL 1500"
   const flightRegex = new RegExp(`\\b(${validCodes})\\s*(\\d{2,4})\\b`, 'gi');
   const flightMatches = [...combinedText.matchAll(flightRegex)];
 
@@ -299,7 +287,6 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
     for (const m of flightMatches) {
       const chunk = combinedText.substring(Math.max(0, m.index! - 150), Math.min(combinedText.length, m.index! + 150));
       
-      // Strict uppercase match for local airports
       const localAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
         .map(a => a[1]).filter(code => VALID_IATA_CODES.has(code));
 
@@ -308,48 +295,6 @@ function parseFlightsFromPayload(payload: any, subject: string = "", fallbackDat
 
       if (localAirports.length >= 2 && flightDate) {
         const iata = m[1].toUpperCase();
-        const num = m[2];
-        const flightNumber = `${iata}${num}`;
-
-        if (!uniqueFlights.has(flightNumber)) {
-           uniqueFlights.set(flightNumber, {
-             flight_number: flightNumber,
-             airline: AIRLINE_NAMES[iata] || iata,
-             departure_airport: localAirports[0],
-             arrival_airport: localAirports.find(a => a !== localAirports[0]) || null,
-             departure_date: flightDate
-           });
-        }
-      }
-    }
-    return Array.from(uniqueFlights.values());
-  }
-
-  return flights;
-}
-
-  // 3. UNIVERSAL FALLBACK: For airlines with NO structured data (KLM, EasyJet, etc.)
-  const validCodes = Object.keys(AIRLINE_NAMES).join('|');
-  const flightRegex = new RegExp(`\\b(${validCodes})\\s*(\\d{2,4})\\b`, 'g');
-  const flightMatches = [...combinedText.matchAll(flightRegex)];
-
-  if (flightMatches.length > 0) {
-    const uniqueFlights = new Map<string, ParsedFlight>();
-    
-    for (const m of flightMatches) {
-      // Create a 150-character proximity chunk to prevent connecting flights from stealing airports
-      const chunk = combinedText.substring(Math.max(0, m.index! - 150), Math.min(combinedText.length, m.index! + 150));
-      
-      const localAirports = [...chunk.matchAll(/\b([A-Z]{3})\b/g)]
-        .map(a => a[1]).filter(code => VALID_IATA_CODES.has(code));
-
-      // Hunt for a date locally first, then expand to the whole email
-      let flightDate = extractDateFromText(chunk, defaultYear);
-      if (!flightDate) flightDate = extractDateFromText(combinedText, defaultYear);
-
-      // We ONLY insert the fallback flight if we confidently found a date and 2 airports
-      if (localAirports.length >= 2 && flightDate) {
-        const iata = m[1];
         const num = m[2];
         const flightNumber = `${iata}${num}`;
 
@@ -384,7 +329,7 @@ export const scanGmail = createServerFn({ method: "POST" })
     if (!googleToken) return { detected: 0, inserted: 0, error: "No Gmail token — sign out and back in" };
 
     const threadsRes = await fetch(
-      `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations newer_than:1095d")}&maxResults=80`,
+      `https://gmail.googleapis.com/gmail/v1/users/me/threads?q=${encodeURIComponent("category:reservations older_than:300d newer_than:1095d")}&maxResults=100`,
       { headers: { Authorization: `Bearer ${googleToken}` } }
     );
     if (!threadsRes.ok) {
@@ -446,7 +391,7 @@ export const scanGmail = createServerFn({ method: "POST" })
       }
       
       for (const f of flights) {
-        if (!f.flight_number || !f.departure_date) continue; // Require a date
+        if (!f.flight_number || !f.departure_date) continue;
         
         const cleanFlight = normalizeFlightNumber(f.flight_number);
         const key = `${cleanFlight}-${f.departure_date}`;
