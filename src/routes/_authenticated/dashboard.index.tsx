@@ -33,13 +33,16 @@ function DashboardHome() {
   const scan = useMutation({
     mutationFn: () => scanFn(),
     onSuccess: async (r: any) => {
-      // Add the !r check to catch undefined responses immediately
+      // ALWAYS log the debug info if it exists, before checking for errors
+      if (r?.debug?.parseDebug) {
+        console.log("PARSE DEBUG:", JSON.stringify(r.debug.parseDebug, null, 2));
+      }
+
+      // Handle the UI toast safely
       if (!r || r.error) {
         toast.error("Scan issue", { description: r?.error || "Server returned no data." });
       } else {
-        // Notice the safe optional chaining on r?.debug instead of r.debug
-        toast.success("Inbox scanned", { description: JSON.stringify(r?.debug?.threadSubjects?.slice(0, 5)) });
-        console.log("PARSE DEBUG:", JSON.stringify(r?.debug?.parseDebug, null, 2));
+        toast.success("Inbox scanned", { description: JSON.stringify(r.debug?.threadSubjects?.slice(0, 5)) });
       }
       
       // Wait for DB write to complete then force fresh fetch
