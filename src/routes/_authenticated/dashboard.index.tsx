@@ -33,12 +33,15 @@ function DashboardHome() {
   const scan = useMutation({
     mutationFn: () => scanFn(),
     onSuccess: async (r: any) => {
-      if (r?.error) {
-        toast.error("Scan issue", { description: r.error });
+      // Add the !r check to catch undefined responses immediately
+      if (!r || r.error) {
+        toast.error("Scan issue", { description: r?.error || "Server returned no data." });
       } else {
-        toast.success("Inbox scanned", { description: JSON.stringify(r.debug?.threadSubjects?.slice(0, 5)) });
-console.log("PARSE DEBUG:", JSON.stringify(r.debug?.parseDebug, null, 2));
+        // Notice the safe optional chaining on r?.debug instead of r.debug
+        toast.success("Inbox scanned", { description: JSON.stringify(r?.debug?.threadSubjects?.slice(0, 5)) });
+        console.log("PARSE DEBUG:", JSON.stringify(r?.debug?.parseDebug, null, 2));
       }
+      
       // Wait for DB write to complete then force fresh fetch
       await new Promise(resolve => setTimeout(resolve, 1500));
       qc.removeQueries({ queryKey: ["flights"] });
